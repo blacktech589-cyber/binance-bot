@@ -430,37 +430,84 @@ def format_signal(signal: Signal) -> str:
 
 
 import json
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
 REST = "https://fapi.binance.com"
+SPOT_MARKET_REST = "https://data-api.binance.vision"
 
 
-def get_json(path: str, params: dict[str, str | int], timeout: float = 10.0):
-    url = f"{REST}{path}?{urlencode(params)}"
+def get_json(path: str, params: dict[str, str | int], timeout: float = 10.0, base: str = REST):
+    url = f"{base}{path}?{urlencode(params)}"
     request = Request(url, headers={"User-Agent": "scalping-signal-dashboard/1.0"})
     with urlopen(request, timeout=timeout) as response:
         return json.load(response)
 
 
+def _is_451(exc: Exception) -> bool:
+    return isinstance(exc, HTTPError) and exc.code == 451
+
+
 def klines(symbol: str, interval: str, limit: int = 250) -> list[Candle]:
-    rows = get_json("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        rows = get_json("/fapi/v1/klines", params)
+    except HTTPError as exc:
+        if not _is_451(exc):
+            raise
+        rows = get_json("/api/v3/klines", params, base=SPOT_MARKET_REST)
     # Son satır açık mumdur. Repaint'i azaltmak için yalnızca kapanmış mumlar kullanılır.
     return [Candle(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]), float(r[9])) for r in rows[:-1]]
 
 
-def market_snapshot(symbol: str, previous_oi: float | None = None) -> tuple[Microstructure, float]:
-    depth = get_json("/fapi/v1/depth", {"symbol": symbol, "limit": 20})
-    ticker = get_json("/fapi/v1/ticker/bookTicker", {"symbol": symbol})
-    oi_payload = get_json("/fapi/v1/openInterest", {"symbol": symbol})
+def market_snapshot(symbol: str, previous_oi: float | None = None) -> tuple[Microstructure, float | None]:
+    try:
+        depth = get_json("/fapi/v1/depth", {"symbol": symbol, "limit": 20})
+        ticker = get_json("/fapi/v1/ticker/bookTicker", {"symbol": symbol})
+        oi_payload = get_json("/fapi/v1/openInterest", {"symbol": symbol})
+        current_oi: float | None = float(oi_payload["openInterest"])
+    except HTTPError as exc:
+        if not _is_451(exc):
+            raise
+        depth = get_json("/api/v3/depth", {"symbol": symbol, "limit": 20}, base=SPOT_MARKET_REST)
+        ticker = get_json("/api/v3/ticker/bookTicker", {"symbol": symbol}, base=SPOT_MARKET_REST)
+        current_oi = None
     bid_qty = sum(float(level[1]) for level in depth["bids"])
     ask_qty = sum(float(level[1]) for level in depth["asks"])
     total = bid_qty + ask_qty
     imbalance = (bid_qty - ask_qty) / total if total else 0.0
-    current_oi = float(oi_payload["openInterest"])
-    oi_change = ((current_oi / previous_oi) - 1.0) * 100.0 if previous_oi else None
+    oi_change = ((current_oi / previous_oi) - 1.0) * 100.0 if current_oi is not None and previous_oi else None
     return Microstructure(float(ticker["bidPrice"]), float(ticker["askPrice"]), imbalance, oi_change), current_oi
+
+
+def active_usdt_symbols() -> tuple[list[str], str]:
+    """Return active symbols ordered by quote volume and the effective data source."""
+    try:
+        exchange = get_json("/fapi/v1/exchangeInfo", {})
+        active = {
+            item["symbol"] for item in exchange.get("symbols", [])
+            if item.get("status") == "TRADING"
+            and item.get("contractType") == "PERPETUAL"
+            and item.get("quoteAsset") == "USDT"
+        }
+        tickers = get_json("/fapi/v1/ticker/24hr", {})
+        source = "USDⓈ-M Futures"
+    except HTTPError as exc:
+        if not _is_451(exc):
+            raise
+        exchange = get_json("/api/v3/exchangeInfo", {}, base=SPOT_MARKET_REST)
+        active = {
+            item["symbol"] for item in exchange.get("symbols", [])
+            if item.get("status") == "TRADING"
+            and item.get("quoteAsset") == "USDT"
+            and item.get("isSpotTradingAllowed", True)
+        }
+        tickers = get_json("/api/v3/ticker/24hr", {}, base=SPOT_MARKET_REST)
+        source = "Spot fallback (Futures HTTP 451)"
+    volumes = {item["symbol"]: float(item.get("quoteVolume", 0)) for item in tickers if item.get("symbol") in active}
+    return sorted(active, key=lambda item: volumes.get(item, 0.0), reverse=True), source
 
 
 def exchange_symbol(symbol: str) -> bool:
@@ -764,19 +811,8 @@ def scan_symbol(symbol: str, cfg: Settings, previous_oi: float | None):
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def futures_catalog() -> list[str]:
-    """All currently trading USDT perpetual symbols, ranked by 24h quote volume."""
-    exchange = get_json("/fapi/v1/exchangeInfo", {})
-    active = {
-        item["symbol"]
-        for item in exchange.get("symbols", [])
-        if item.get("status") == "TRADING"
-        and item.get("contractType") == "PERPETUAL"
-        and item.get("quoteAsset") == "USDT"
-    }
-    tickers = get_json("/fapi/v1/ticker/24hr", {})
-    volumes = {item["symbol"]: float(item.get("quoteVolume", 0)) for item in tickers if item.get("symbol") in active}
-    return sorted(active, key=lambda item: volumes.get(item, 0.0), reverse=True)
+def futures_catalog() -> tuple[list[str], str]:
+    return active_usdt_symbols()
 
 
 def render_signal(signal: Signal, eligible: bool) -> None:
@@ -829,10 +865,15 @@ with st.sidebar:
     st.caption("🤖 BOT CONTROL")
     st.header("Ayarlar")
     try:
-        all_symbols = futures_catalog()
+        all_symbols, market_source = futures_catalog()
     except Exception as exc:
         st.warning(f"Parite kataloğu alınamadı; temel liste kullanılıyor: {exc}")
         all_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
+        market_source = "Temel liste"
+    if "Spot fallback" in market_source:
+        st.warning("Streamlit Cloud Binance Futures'a HTTP 451 döndürüyor. Panel resmî Binance Spot market verisine geçti; OI ve Cloud'dan gerçek Futures emirleri kullanılamaz.")
+    else:
+        st.success(f"Veri kaynağı: {market_source}")
     symbol = st.selectbox("Detay paritesi", all_symbols, index=0)
     default_radar = all_symbols[: min(5, len(all_symbols))]
     selected_radar_symbols = st.multiselect(
@@ -864,7 +905,8 @@ with st.sidebar:
     auto_send = st.toggle("Geçerli sinyali otomatik gönder", False)
     st.divider()
     st.subheader("Binance emir bağlantısı")
-    trading_enabled = st.toggle("Emir modunu etkinleştir", False)
+    futures_region_blocked = "Spot fallback" in market_source
+    trading_enabled = st.toggle("Emir modunu etkinleştir", False, disabled=futures_region_blocked)
     environment = st.radio("Ortam", ["TESTNET", "LIVE"], horizontal=True)
     binance_key = st.text_input("Binance API key", value=secret("BINANCE_API_KEY"), type="password")
     binance_secret = st.text_input("Binance API secret", value=secret("BINANCE_API_SECRET"), type="password")
@@ -912,6 +954,8 @@ if "traded_candles" not in st.session_state:
 
 
 def execute_trade(signal: Signal):
+    if futures_region_blocked:
+        raise BinanceAPIError("Bu Streamlit Cloud bölgesinde Binance Futures HTTP 451 ile engelli; emri yerel/VPS kurulumundan gönderin")
     if not trading_enabled or not credentials_ready:
         raise BinanceAPIError("Emir modu ve API bilgileri gerekli")
     if not live_unlocked:
