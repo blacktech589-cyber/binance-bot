@@ -430,6 +430,7 @@ def format_signal(signal: Signal) -> str:
 
 
 import json
+from functools import lru_cache
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -508,6 +509,43 @@ def active_usdt_symbols() -> tuple[list[str], str]:
         source = "Spot fallback (Futures HTTP 451)"
     volumes = {item["symbol"]: float(item.get("quoteVolume", 0)) for item in tickers if item.get("symbol") in active}
     return sorted(active, key=lambda item: volumes.get(item, 0.0), reverse=True), source
+
+
+@lru_cache(maxsize=2048)
+def binance_all_time_low(symbol: str) -> tuple[float, int]:
+    """Lowest daily low since the symbol was listed on Binance and its open time."""
+    path, base = "/fapi/v1/klines", REST
+    start_time = 0
+    lowest = float("inf")
+    lowest_time = 0
+    for _ in range(10):
+        page_limit = 1500 if base == REST else 1000
+        params = {"symbol": symbol, "interval": "1d", "limit": page_limit, "startTime": start_time}
+        try:
+            rows = get_json(path, params, timeout=15, base=base)
+        except HTTPError as exc:
+            if base != REST or not _is_451(exc):
+                raise
+            path, base = "/api/v3/klines", SPOT_MARKET_REST
+            start_time = 0
+            page_limit = 1000
+            params["limit"] = page_limit
+            rows = get_json(path, params, timeout=15, base=base)
+        if not rows:
+            break
+        for row in rows:
+            low = float(row[3])
+            if low < lowest:
+                lowest, lowest_time = low, int(row[0])
+        if len(rows) < page_limit:
+            break
+        next_start = int(rows[-1][0]) + 1
+        if next_start <= start_time:
+            break
+        start_time = next_start
+    if lowest == float("inf"):
+        raise RuntimeError(f"{symbol} için tarihsel mum bulunamadı")
+    return lowest, lowest_time
 
 
 def exchange_symbol(symbol: str) -> bool:
@@ -810,13 +848,15 @@ def scan_symbol(symbol: str, cfg: Settings, previous_oi: float | None):
     micro, current_oi = market_snapshot(symbol, previous_oi)
     three_day_high = max(candle.high for candle in hourly) if hourly else one[-1].close
     drawdown_pct = (one[-1].close / three_day_high - 1.0) * 100.0 if three_day_high > 0 else 0.0
+    all_time_low, all_time_low_time = binance_all_time_low(symbol)
+    atl_distance_pct = (one[-1].close / all_time_low - 1.0) * 100.0 if all_time_low > 0 else float("inf")
     last_three = one[-3:]
     three_candle_reversal = (
         len(last_three) == 3
         and all(candle.close > candle.open for candle in last_three)
         and last_three[0].close < last_three[1].close < last_three[2].close
     )
-    return one, five, micro, current_oi, assess(symbol, one, five, micro, cfg), drawdown_pct, three_candle_reversal
+    return one, five, micro, current_oi, assess(symbol, one, five, micro, cfg), drawdown_pct, three_candle_reversal, all_time_low, all_time_low_time, atl_distance_pct
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -1006,7 +1046,7 @@ def dashboard() -> None:
                     errors[item] = str(exc)
         if symbol not in packets:
             raise RuntimeError(errors.get(symbol, "seçili sembol verisi yok"))
-        one, five, micro, current_oi, results, selected_drawdown, selected_reversal = packets[symbol]
+        one, five, micro, current_oi, results, selected_drawdown, selected_reversal, selected_atl, selected_atl_time, selected_atl_distance = packets[symbol]
         for item, packet in packets.items():
             st.session_state.oi[item] = packet[3]
     except Exception as exc:
@@ -1035,7 +1075,7 @@ def dashboard() -> None:
         if packet is None:
             radar_rows.append({"Parite": item, "Durum": "Veri hatası", "Hata": errors.get(item, "-")})
             continue
-        item_one, _, item_micro, _, item_results, drawdown_pct, three_candle_reversal = packet
+        item_one, _, item_micro, _, item_results, drawdown_pct, three_candle_reversal, all_time_low, all_time_low_time, atl_distance_pct = packet
         best = max(item_results.values(), key=lambda candidate: candidate.confidence, default=None)
         if best is None:
             continue
@@ -1062,6 +1102,9 @@ def dashboard() -> None:
             "ATR bps": round(best.atr_bps, 2),
             "3g zirveden düşüş %": round(drawdown_pct, 2),
             "3 yeşil mum": "EVET" if three_candle_reversal else "HAYIR",
+            "Binance ATL": all_time_low,
+            "ATL uzaklık %": round(atl_distance_pct, 2),
+            "ATL tarihi": datetime.fromtimestamp(all_time_low_time / 1000).strftime("%Y-%m-%d"),
             "Güncellendi": datetime.now().strftime("%H:%M:%S"),
         })
     for row in radar_rows:
@@ -1086,7 +1129,7 @@ def dashboard() -> None:
         packet = packets.get(item)
         if packet is None:
             continue
-        _, _, _, _, item_results, drawdown_pct, three_candle_reversal = packet
+        _, _, _, _, item_results, drawdown_pct, three_candle_reversal, _, _, _ = packet
         if drawdown_pct <= -float(crash_threshold_pct) and three_candle_reversal:
             best = max(item_results.values(), key=lambda candidate: candidate.confidence, default=None)
             if best is not None:
@@ -1101,6 +1144,21 @@ def dashboard() -> None:
         )
     else:
         st.caption(f"3 günlük zirveden en az %{crash_threshold_pct} düşüp son üç 1m mumu yükselen coin bulunmadı.")
+    atl_candidates = []
+    for item in radar_symbols:
+        packet = packets.get(item)
+        if packet is None:
+            continue
+        current_price = packet[0][-1].close
+        all_time_low, all_time_low_time, atl_distance_pct = packet[7], packet[8], packet[9]
+        atl_candidates.append((atl_distance_pct, item, current_price, all_time_low, all_time_low_time))
+    if atl_candidates:
+        distance, atl_symbol, current_price, atl_price, atl_time = min(atl_candidates)
+        st.info(
+            f"Binance tarihindeki ATL'ye en yakın coin (bu tur): {atl_symbol} · güncel {current_price:g} · "
+            f"ATL {atl_price:g} ({datetime.fromtimestamp(atl_time / 1000).strftime('%Y-%m-%d')}) · "
+            f"ATL üzerinde %{distance:.2f}."
+        )
     if errors:
         with st.expander("Radar veri hataları"):
             st.json(errors)
