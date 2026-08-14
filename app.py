@@ -875,16 +875,19 @@ with st.sidebar:
     else:
         st.success(f"Veri kaynağı: {market_source}")
     symbol = st.selectbox("Detay paritesi", all_symbols, index=0)
+    scan_all_market = st.toggle("Tüm piyasayı sürekli tara", True)
+    scan_batch_size = st.slider("Her turda analiz edilen coin", 5, 20, 10, 5, disabled=not scan_all_market)
     default_radar = all_symbols[: min(5, len(all_symbols))]
     selected_radar_symbols = st.multiselect(
         f"Radar pariteleri · {len(all_symbols)} aktif USDT perpetual",
         all_symbols,
         default=default_radar,
         help="Liste 24 saatlik hacme göre sıralanır. Tüm aktif pariteler seçilebilir.",
+        disabled=scan_all_market,
     )
     if len(selected_radar_symbols) > 20:
         st.warning("API yükünü sınırlamak için ilk 20 seçili parite taranacak.")
-    radar_symbols = selected_radar_symbols[:20]
+    manual_radar_symbols = selected_radar_symbols[:20]
     refresh_seconds = st.slider("Yenileme (saniye)", 5, 60, 15, 5)
     live = st.toggle("Canlı yenileme", True)
     min_checks = st.slider("Minimum teknik koşul", 1, 8, 6)
@@ -951,6 +954,10 @@ if "sent_candles" not in st.session_state:
     st.session_state.sent_candles = set()
 if "traded_candles" not in st.session_state:
     st.session_state.traded_candles = set()
+if "scan_offset" not in st.session_state:
+    st.session_state.scan_offset = 0
+if "radar_history" not in st.session_state:
+    st.session_state.radar_history = {}
 
 
 def execute_trade(signal: Signal):
@@ -969,6 +976,12 @@ run_every = refresh_seconds if live else None
 
 @st.fragment(run_every=run_every)
 def dashboard() -> None:
+    if scan_all_market and all_symbols:
+        offset = int(st.session_state.scan_offset) % len(all_symbols)
+        radar_symbols = [all_symbols[(offset + index) % len(all_symbols)] for index in range(min(scan_batch_size, len(all_symbols)))]
+    else:
+        offset = 0
+        radar_symbols = manual_radar_symbols
     symbols_to_scan = list(dict.fromkeys([symbol, *radar_symbols]))
     packets = {}
     errors = {}
@@ -999,6 +1012,12 @@ def dashboard() -> None:
     st.line_chart(chart, height=260)
 
     st.subheader("🛰️ Çoklu Coin Fırsat Radarı")
+    if scan_all_market:
+        end_position = min(offset + len(radar_symbols), len(all_symbols))
+        st.caption(
+            f"Dönüşümlü tarama: {offset + 1}–{end_position} / {len(all_symbols)} · "
+            f"Bu tur: {', '.join(radar_symbols)}"
+        )
     radar_rows = []
     eligible_candidates = []
     for item in radar_symbols:
@@ -1031,9 +1050,13 @@ def dashboard() -> None:
             "VWAP Δ bps": round(best.vwap_deviation_bps, 2),
             "Z-score": round(best.price_zscore, 2),
             "ATR bps": round(best.atr_bps, 2),
+            "Güncellendi": datetime.now().strftime("%H:%M:%S"),
         })
-    if radar_rows:
-        radar_frame = pd.DataFrame(radar_rows)
+    for row in radar_rows:
+        st.session_state.radar_history[row["Parite"]] = row
+    visible_rows = list(st.session_state.radar_history.values()) if scan_all_market else radar_rows
+    if visible_rows:
+        radar_frame = pd.DataFrame(visible_rows)
         if "Skor" in radar_frame.columns:
             radar_frame = radar_frame.sort_values("Skor", ascending=False, na_position="last")
         st.dataframe(radar_frame, hide_index=True, use_container_width=True, height=min(390, 42 + len(radar_frame) * 36))
@@ -1049,6 +1072,8 @@ def dashboard() -> None:
     if errors:
         with st.expander("Radar veri hataları"):
             st.json(errors)
+    if scan_all_market and all_symbols:
+        st.session_state.scan_offset = (offset + len(radar_symbols)) % len(all_symbols)
 
     long_tab, short_tab = st.tabs(["LONG", "SHORT"])
     eligible_signals = []
