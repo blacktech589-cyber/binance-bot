@@ -337,7 +337,6 @@ def assess(symbol: str, one: list[Candle], five: list[Candle], micro: Microstruc
 
 import html
 
-import aiohttp
 
 
 
@@ -374,14 +373,6 @@ def format_signal(signal: Signal) -> str:
         f"SL: <code>{_price(signal.stop)}</code>\n\n"
         f"<i>ATR tabanlı seviyeler; yatırım tavsiyesi değildir.</i>"
     )
-
-
-async def send(session: aiohttp.ClientSession, token: str, chat_id: str, text: str) -> None:
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    async with session.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}) as response:
-        payload = await response.text()
-        if response.status >= 400:
-            raise RuntimeError(f"Telegram HTTP {response.status}: {payload[:300]}")
 
 
 # ==================== rest.py ====================
@@ -631,148 +622,6 @@ class FuturesClient:
         return TradeResult(int(entry["orderId"]), qty_text, average_price, self._algo_id(stop), self._algo_id(tp1), self._algo_id(tp2), "TESTNET" if self.testnet else "LIVE", slippage_bps)
 
 
-# ==================== bot.py ====================
-
-
-import asyncio
-import json
-import logging
-import time
-from collections import defaultdict, deque
-
-import aiohttp
-
-
-REST = "https://fapi.binance.com"
-WS = "wss://fstream.binance.com/stream?streams="
-LOGGER = logging.getLogger("scalper")
-
-
-class MarketBot:
-    def __init__(self, cfg: Settings) -> None:
-        self.cfg = cfg
-        self.candles: dict[str, dict[str, deque[Candle]]] = defaultdict(lambda: {"1m": deque(maxlen=300), "5m": deque(maxlen=300)})
-        self.micro: dict[str, Microstructure] = defaultdict(Microstructure)
-        self.last_oi: dict[str, float] = {}
-        self.last_signal: dict[tuple[str, str], float] = {}
-        self.session: aiohttp.ClientSession | None = None
-
-    async def _json(self, path: str, params: dict[str, str | int]) -> object:
-        assert self.session
-        async with self.session.get(REST + path, params=params) as response:
-            response.raise_for_status()
-            return await response.json()
-
-    async def bootstrap(self) -> None:
-        for symbol in self.cfg.symbols:
-            for interval in ("1m", "5m"):
-                rows = await self._json("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": 250})
-                assert isinstance(rows, list)
-                self.candles[symbol][interval].extend(self._from_rest(row) for row in rows[:-1])
-            LOGGER.info("Bootstrapped %s", symbol)
-
-    @staticmethod
-    def _from_rest(row: list[object]) -> Candle:
-        return Candle(int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]), float(row[9]))
-
-    async def poll_open_interest(self) -> None:
-        while True:
-            for symbol in self.cfg.symbols:
-                try:
-                    payload = await self._json("/fapi/v1/openInterest", {"symbol": symbol})
-                    assert isinstance(payload, dict)
-                    current = float(payload["openInterest"])
-                    previous = self.last_oi.get(symbol)
-                    change = ((current / previous) - 1.0) * 100.0 if previous and previous > 0 else None
-                    old = self.micro[symbol]
-                    self.micro[symbol] = Microstructure(old.bid, old.ask, old.imbalance, change)
-                    self.last_oi[symbol] = current
-                except Exception:
-                    LOGGER.exception("Open interest alınamadı: %s", symbol)
-                await asyncio.sleep(0.25)
-            await asyncio.sleep(55)
-
-    def _streams(self) -> str:
-        streams = []
-        for symbol in self.cfg.symbols:
-            s = symbol.lower()
-            streams.extend((f"{s}@kline_1m", f"{s}@kline_5m", f"{s}@depth20@500ms", f"{s}@bookTicker"))
-        return "/".join(streams)
-
-    async def run_websocket(self) -> None:
-        assert self.session
-        delay = 1
-        while True:
-            try:
-                async with self.session.ws_connect(WS + self._streams(), heartbeat=30, receive_timeout=90) as ws:
-                    LOGGER.info("WebSocket bağlı (%d sembol)", len(self.cfg.symbols))
-                    delay = 1
-                    async for message in ws:
-                        if message.type == aiohttp.WSMsgType.TEXT:
-                            await self.handle(json.loads(message.data))
-                        elif message.type in {aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED}:
-                            break
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                LOGGER.exception("WebSocket koptu; %ss sonra yeniden bağlanıyor", delay)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 60)
-
-    async def handle(self, wrapper: dict[str, object]) -> None:
-        stream = str(wrapper.get("stream", ""))
-        data = wrapper.get("data")
-        if not isinstance(data, dict):
-            return
-        symbol = str(data.get("s") or stream.split("@", 1)[0]).upper()
-        old = self.micro[symbol]
-        if "depth20" in stream:
-            bids = data.get("b") or data.get("bids") or []
-            asks = data.get("a") or data.get("asks") or []
-            bid_qty = sum(float(level[1]) for level in bids)
-            ask_qty = sum(float(level[1]) for level in asks)
-            total = bid_qty + ask_qty
-            imbalance = (bid_qty - ask_qty) / total if total > 0 else 0.0
-            self.micro[symbol] = Microstructure(old.bid, old.ask, imbalance, old.oi_change_pct)
-        elif "bookTicker" in stream:
-            self.micro[symbol] = Microstructure(float(data["b"]), float(data["a"]), old.imbalance, old.oi_change_pct)
-        elif "@kline_" in stream:
-            kline = data.get("k")
-            if not isinstance(kline, dict) or not kline.get("x"):
-                return
-            interval = str(kline["i"])
-            candle = Candle(int(kline["t"]), float(kline["o"]), float(kline["h"]), float(kline["l"]), float(kline["c"]), float(kline["v"]), float(kline["V"]))
-            target = self.candles[symbol][interval]
-            if not target or target[-1].open_time != candle.open_time:
-                target.append(candle)
-            if interval == "1m":
-                await self.maybe_signal(symbol)
-
-    async def maybe_signal(self, symbol: str) -> None:
-        signal = evaluate(symbol, list(self.candles[symbol]["1m"]), list(self.candles[symbol]["5m"]), self.micro[symbol], self.cfg)
-        if signal is None:
-            LOGGER.info("%s: sinyal yok", symbol)
-            return
-        key = (symbol, signal.side)
-        now = time.monotonic()
-        if now - self.last_signal.get(key, 0) < self.cfg.cooldown_minutes * 60:
-            LOGGER.info("%s %s: cooldown", symbol, signal.side)
-            return
-        text = format_signal(signal)
-        LOGGER.info("SİNYAL\n%s", text)
-        assert self.session
-        if self.cfg.telegram_enabled:
-            await send(self.session, self.cfg.telegram_token, self.cfg.telegram_chat_id, text)
-        self.last_signal[key] = now
-
-    async def run(self) -> None:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            self.session = session
-            await self.bootstrap()
-            await asyncio.gather(self.poll_open_interest(), self.run_websocket())
-
-
 # ==================== streamlit_app.py ====================
 
 
@@ -788,6 +637,46 @@ import streamlit as st
 
 st.set_page_config(page_title="Futures Scalping Radar", page_icon="⚡", layout="wide")
 load_dotenv()
+
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: radial-gradient(circle at 15% 0%, #13233d 0, #07111f 38%, #040914 100%);
+    }
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0c1728 0%, #07101d 100%);
+        border-right: 1px solid rgba(70, 211, 154, .16);
+    }
+    [data-testid="stMetric"] {
+        background: linear-gradient(145deg, rgba(18, 35, 57, .94), rgba(8, 18, 32, .94));
+        border: 1px solid rgba(102, 190, 255, .15);
+        border-radius: 14px;
+        padding: 14px 16px;
+        box-shadow: 0 8px 28px rgba(0, 0, 0, .18);
+    }
+    [data-testid="stMetricValue"] { color: #e9f7ff; }
+    .hero {
+        padding: 22px 26px;
+        border-radius: 20px;
+        background: linear-gradient(120deg, rgba(18, 55, 88, .92), rgba(10, 28, 51, .9));
+        border: 1px solid rgba(65, 213, 157, .22);
+        box-shadow: 0 14px 45px rgba(0,0,0,.22);
+        margin-bottom: 18px;
+    }
+    .hero h1 { margin: 0; color: #f4fbff; font-size: 2rem; }
+    .hero p { margin: 8px 0 0; color: #9fb4c9; }
+    .status-chip {
+        display: inline-block; padding: 5px 10px; border-radius: 999px;
+        color: #66efb7; background: rgba(34, 197, 130, .11);
+        border: 1px solid rgba(34, 197, 130, .25); font-size: .78rem;
+    }
+    div[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
+    .stButton > button { border-radius: 10px; font-weight: 650; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 def secret(name: str) -> str:
@@ -843,8 +732,16 @@ def render_signal(signal: Signal, eligible: bool) -> None:
         st.caption("Skor veya 6/8 teknik koşul eşiği henüz geçilmedi.")
 
 
-st.title("⚡ Binance Futures Scalping Radar")
-st.caption("1m giriş · 5m trend · order book · taker hacmi · open interest · sinyal modu")
+st.markdown(
+    """
+    <div class="hero">
+      <span class="status-chip">● BINANCE USDⓈ-M FUTURES</span>
+      <h1>⚡ Scalping Command Center</h1>
+      <p>1m giriş · 5m trend · mikro yapı · istatistiksel sapma · korumalı emir yönetimi</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     st.header("Ayarlar")
