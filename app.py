@@ -40,6 +40,11 @@ class Settings:
     min_atr_bps: float = 1.0
     max_atr_bps: float = 60.0
     max_entry_slippage_bps: float = 5.0
+    min_total_features: int = 14
+    min_trend_strength_atr: float = 0.15
+    min_bollinger_width_bps: float = 4.0
+    max_bollinger_width_bps: float = 150.0
+    min_candle_body_ratio: float = 0.45
     log_level: str = "INFO"
 
     @classmethod
@@ -72,6 +77,11 @@ class Settings:
             min_atr_bps=float(os.getenv("MIN_ATR_BPS", "1.0")),
             max_atr_bps=float(os.getenv("MAX_ATR_BPS", "60.0")),
             max_entry_slippage_bps=float(os.getenv("MAX_ENTRY_SLIPPAGE_BPS", "5.0")),
+            min_total_features=int(os.getenv("MIN_TOTAL_FEATURES", "14")),
+            min_trend_strength_atr=float(os.getenv("MIN_TREND_STRENGTH_ATR", "0.15")),
+            min_bollinger_width_bps=float(os.getenv("MIN_BOLLINGER_WIDTH_BPS", "4.0")),
+            max_bollinger_width_bps=float(os.getenv("MAX_BOLLINGER_WIDTH_BPS", "150.0")),
+            min_candle_body_ratio=float(os.getenv("MIN_CANDLE_BODY_RATIO", "0.45")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
         if not settings.symbols:
@@ -84,6 +94,8 @@ class Settings:
             raise ValueError("MIN_QUALITY_CHECKS 0 ile 4 arasında olmalı")
         if settings.min_atr_bps >= settings.max_atr_bps:
             raise ValueError("MIN_ATR_BPS, MAX_ATR_BPS değerinden küçük olmalı")
+        if not 0 <= settings.min_total_features <= 20:
+            raise ValueError("MIN_TOTAL_FEATURES 0 ile 20 arasında olmalı")
         if settings.telegram_enabled and not (settings.telegram_token and settings.telegram_chat_id):
             raise ValueError("Telegram etkin: TELEGRAM_BOT_TOKEN ve TELEGRAM_CHAT_ID gerekli")
         return settings
@@ -234,6 +246,12 @@ class Signal:
     ema_distance_atr: float
     price_zscore: float
     atr_bps: float
+    structure_checks: dict[str, bool]
+    all_features: dict[str, bool]
+    total_passed: int
+    trend_strength_atr: float
+    bollinger_width_bps: float
+    candle_body_ratio: float
 
 
 def _evaluate_side(symbol: str, side: Literal["LONG", "SHORT"], one: list[Candle], five: list[Candle], micro: Microstructure, cfg: Settings, require_gate: bool = True) -> Signal | None:
@@ -245,8 +263,10 @@ def _evaluate_side(symbol: str, side: Literal["LONG", "SHORT"], one: list[Candle
     volumes = [c.volume for c in one]
     five_closes = [c.close for c in five]
     entry = closes[-1]
-    ema20_1m = ema(closes, 20)[-1]
-    ema20_5m = ema(five_closes, 20)[-1]
+    ema20_1m_series = ema(closes, 20)
+    ema20_1m = ema20_1m_series[-1]
+    ema20_5m_series = ema(five_closes, 20)
+    ema20_5m = ema20_5m_series[-1]
     ema50_5m = ema(five_closes, 50)[-1]
     rsi7 = rsi(closes, 7)[-1]
     hist = macd_histogram(closes)
@@ -256,6 +276,14 @@ def _evaluate_side(symbol: str, side: Literal["LONG", "SHORT"], one: list[Candle
     ema_distance_atr = abs(entry - ema20_1m) / current_atr if current_atr > 0 else float("inf")
     price_zscore = zscore(closes, 20)
     atr_bps = current_atr / entry * 10_000.0 if entry > 0 else float("inf")
+    five_highs = [c.high for c in five]
+    five_lows = [c.low for c in five]
+    five_atr = atr(five_highs, five_lows, five_closes, 14)
+    trend_strength_atr = abs(ema20_5m - ema50_5m) / five_atr if five_atr > 0 else 0.0
+    _, price_std = mean_std(closes, 20)
+    bollinger_width_bps = (4.0 * price_std / entry * 10_000.0) if entry > 0 else 0.0
+    candle_range = one[-1].high - one[-1].low
+    candle_body_ratio = abs(one[-1].close - one[-1].open) / candle_range if candle_range > 0 else 0.0
     quality_checks = {
         "VWAP Sapması": abs(vwap_deviation_bps) <= cfg.max_vwap_deviation_bps,
         "EMA/ATR Mesafesi": ema_distance_atr <= cfg.max_ema_distance_atr,
@@ -282,6 +310,13 @@ def _evaluate_side(symbol: str, side: Literal["LONG", "SHORT"], one: list[Candle
         taker_ratio = one[-1].taker_buy_volume / one[-1].volume if one[-1].volume > 0 else 0.5
         taker_ok = taker_ratio >= cfg.taker_ratio_threshold
         oi_ok = micro.oi_change_pct is not None and micro.oi_change_pct >= cfg.oi_change_threshold_pct
+        structure_checks = {
+            "Trend Gücü": trend_strength_atr >= cfg.min_trend_strength_atr,
+            "EMA20 Eğimi": ema20_1m_series[-1] > ema20_1m_series[-4],
+            "Bollinger Genişliği": cfg.min_bollinger_width_bps <= bollinger_width_bps <= cfg.max_bollinger_width_bps,
+            "Mum Gövdesi": one[-1].close > one[-1].open and candle_body_ratio >= cfg.min_candle_body_ratio,
+            "Kısa Momentum": sum(closes[i] > closes[i - 1] for i in range(len(closes) - 3, len(closes))) >= 2,
+        }
     else:
         checks = {
             "5M Trend": ema20_5m < ema50_5m,
@@ -297,21 +332,33 @@ def _evaluate_side(symbol: str, side: Literal["LONG", "SHORT"], one: list[Candle
         taker_ratio = one[-1].taker_buy_volume / one[-1].volume if one[-1].volume > 0 else 0.5
         taker_ok = taker_ratio <= 1.0 - cfg.taker_ratio_threshold
         oi_ok = micro.oi_change_pct is not None and micro.oi_change_pct >= cfg.oi_change_threshold_pct
+        structure_checks = {
+            "Trend Gücü": trend_strength_atr >= cfg.min_trend_strength_atr,
+            "EMA20 Eğimi": ema20_1m_series[-1] < ema20_1m_series[-4],
+            "Bollinger Genişliği": cfg.min_bollinger_width_bps <= bollinger_width_bps <= cfg.max_bollinger_width_bps,
+            "Mum Gövdesi": one[-1].close < one[-1].open and candle_body_ratio >= cfg.min_candle_body_ratio,
+            "Kısa Momentum": sum(closes[i] < closes[i - 1] for i in range(len(closes) - 3, len(closes))) >= 2,
+        }
 
     base_passed = sum(checks.values())
-    # Teknik yapı %70, mikro yapı %30. OI ilk örnek gelene kadar nötr (yarım puan).
-    micro_points = 10 * orderbook_ok + 10 * taker_ok + (10 * oi_ok if micro.oi_change_pct is not None else 5)
-    # Kalite filtresi puan eklemek yerine başarısızlıkta ceza uygular; aşırı uzamış hareketler
-    # yalnızca çok sayıda klasik indikatör aynı yönde diye yüksek skor alamaz.
-    quality_penalty = (4 - quality_passed) * 5
-    confidence = round(base_passed / 8 * 70 + micro_points - quality_penalty)
-    if require_gate and (base_passed < cfg.min_base_checks or quality_passed < cfg.min_quality_checks or confidence < cfg.min_confidence):
+    micro_checks = {"Order Book": orderbook_ok, "Taker Hacmi": taker_ok, "Open Interest": oi_ok}
+    all_features = {**checks, **quality_checks, **micro_checks, **structure_checks}
+    total_passed = sum(all_features.values())
+    # 20 özellik: klasik teknik %40, sapma/kalite %30, mikro yapı %20, yapı/momentum %10.
+    oi_score = float(oi_ok) if micro.oi_change_pct is not None else 0.5
+    confidence = round(
+        base_passed * 5.0
+        + quality_passed * 7.5
+        + (float(orderbook_ok) + float(taker_ok) + oi_score) * (20.0 / 3.0)
+        + sum(structure_checks.values()) * 2.0
+    )
+    if require_gate and (base_passed < cfg.min_base_checks or quality_passed < cfg.min_quality_checks or total_passed < cfg.min_total_features or confidence < cfg.min_confidence):
         return None
     if side == "LONG":
         stop, tp1, tp2 = entry - 0.8 * current_atr, entry + 0.8 * current_atr, entry + 1.2 * current_atr
     else:
         stop, tp1, tp2 = entry + 0.8 * current_atr, entry - 0.8 * current_atr, entry - 1.2 * current_atr
-    return Signal(symbol, side, max(0, min(confidence, 100)), base_passed, checks, entry, tp1, tp2, stop, current_atr, micro.spread_bps, micro.imbalance, taker_ratio, micro.oi_change_pct, quality_checks, quality_passed, vwap_deviation_bps, ema_distance_atr, price_zscore, atr_bps)
+    return Signal(symbol, side, max(0, min(confidence, 100)), base_passed, checks, entry, tp1, tp2, stop, current_atr, micro.spread_bps, micro.imbalance, taker_ratio, micro.oi_change_pct, quality_checks, quality_passed, vwap_deviation_bps, ema_distance_atr, price_zscore, atr_bps, structure_checks, all_features, total_passed, trend_strength_atr, bollinger_width_bps, candle_body_ratio)
 
 
 def evaluate(symbol: str, one: list[Candle], five: list[Candle], micro: Microstructure, cfg: Settings) -> Signal | None:
@@ -358,12 +405,16 @@ def format_signal(signal: Signal) -> str:
         f"<b>{html.escape(signal.symbol)} — {signal.side}</b>\n\n"
         f"Entry: <code>{_price(signal.entry)}</code>\n"
         f"Confidence: <b>{signal.confidence}/100</b> ({signal.base_passed}/8)\n\n"
+        f"20 özellik: <b>{signal.total_passed}/20</b>\n\n"
         f"<pre>{checks}</pre>\n"
         f"<b>Sapma / kalite ({signal.quality_passed}/4)</b>\n<pre>{quality}</pre>\n"
         f"VWAP Δ: {signal.vwap_deviation_bps:+.2f} bps\n"
         f"EMA uzaklığı: {signal.ema_distance_atr:.2f} ATR\n"
         f"Z-score: {signal.price_zscore:+.2f}\n"
         f"ATR: {signal.atr_bps:.2f} bps\n"
+        f"Trend gücü: {signal.trend_strength_atr:.2f} ATR\n"
+        f"Bollinger genişliği: {signal.bollinger_width_bps:.2f} bps\n"
+        f"Mum gövdesi: {signal.candle_body_ratio:.0%}\n"
         f"Order book: {signal.imbalance:+.3f}\n"
         f"Taker buy: {signal.taker_ratio:.1%}\n"
         f"OI Δ: {oi}\n"
@@ -708,7 +759,7 @@ def render_signal(signal: Signal, eligible: bool) -> None:
     st.subheader(f"{signal.side} · {score_label(signal.confidence)}")
     a, b, c, d = st.columns(4)
     a.metric("Skor", f"{signal.confidence}/100")
-    b.metric("Teknik koşul", f"{signal.base_passed}/8")
+    b.metric("20 özellik", f"{signal.total_passed}/20")
     c.metric("Spread", f"{signal.spread_bps:.2f} bps")
     d.metric("Order book", f"{signal.imbalance:+.3f}")
     rows = [{"Koşul": key, "Durum": "✅" if value else "❌"} for key, value in signal.checks.items()]
@@ -721,6 +772,13 @@ def render_signal(signal: Signal, eligible: bool) -> None:
     q2.metric("EMA mesafesi", f"{signal.ema_distance_atr:.2f} ATR")
     q3.metric("20m Z-score", f"{signal.price_zscore:+.2f}")
     q4.metric("ATR volatilitesi", f"{signal.atr_bps:.2f} bps")
+    st.markdown("**Trend, yapı ve momentum**")
+    structure_rows = [{"Özellik": key, "Durum": "✅" if value else "❌"} for key, value in signal.structure_checks.items()]
+    st.dataframe(pd.DataFrame(structure_rows), hide_index=True, use_container_width=True)
+    s1, s2, s3 = st.columns(3)
+    s1.metric("5m trend gücü", f"{signal.trend_strength_atr:.2f} ATR")
+    s2.metric("Bollinger genişliği", f"{signal.bollinger_width_bps:.2f} bps")
+    s3.metric("Mum gövdesi", f"{signal.candle_body_ratio:.0%}")
     p1, p2, p3, p4 = st.columns(4)
     p1.metric("Entry", f"{signal.entry:,.4f}")
     p2.metric("TP1", f"{signal.tp1:,.4f}")
@@ -744,6 +802,7 @@ st.markdown(
 )
 
 with st.sidebar:
+    st.caption("🤖 BOT CONTROL")
     st.header("Ayarlar")
     symbol = st.text_input("Sembol", "BTCUSDT").upper().replace("/", "").strip()
     refresh_seconds = st.slider("Yenileme (saniye)", 5, 60, 15, 5)
@@ -751,6 +810,7 @@ with st.sidebar:
     min_checks = st.slider("Minimum teknik koşul", 1, 8, 6)
     min_confidence = st.slider("Minimum skor", 0, 100, 70, 5)
     min_quality_checks = st.slider("Minimum sapma/kalite filtresi", 0, 4, 3)
+    min_total_features = st.slider("Minimum toplam özellik", 0, 20, 14)
     max_spread = st.number_input("Maksimum spread (bps)", 0.1, 20.0, 2.0, 0.1)
     volume_multiplier = st.number_input("Hacim çarpanı", 1.0, 5.0, 1.3, 0.1)
     with st.expander("Sapma ve volatilite sınırları"):
@@ -799,6 +859,9 @@ cfg = Settings(
     max_zscore=max_zscore, max_ema_distance_atr=max_ema_distance,
     min_atr_bps=min_atr_bps, max_atr_bps=max_atr_bps,
     max_entry_slippage_bps=max_entry_slippage,
+    min_total_features=min_total_features, min_trend_strength_atr=.15,
+    min_bollinger_width_bps=4.0, max_bollinger_width_bps=150.0,
+    min_candle_body_ratio=.45,
 )
 
 if "oi" not in st.session_state:
@@ -849,7 +912,7 @@ def dashboard() -> None:
             if signal is None:
                 st.warning("Gösterge hesabı için yeterli veri yok.")
                 continue
-            eligible = signal.base_passed >= cfg.min_base_checks and signal.quality_passed >= cfg.min_quality_checks and signal.confidence >= cfg.min_confidence
+            eligible = signal.base_passed >= cfg.min_base_checks and signal.quality_passed >= cfg.min_quality_checks and signal.total_passed >= cfg.min_total_features and signal.confidence >= cfg.min_confidence
             render_signal(signal, eligible)
             if eligible:
                 eligible_signals.append(signal)
