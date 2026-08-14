@@ -806,8 +806,17 @@ def score_label(score: int) -> str:
 def scan_symbol(symbol: str, cfg: Settings, previous_oi: float | None):
     one = klines(symbol, "1m")
     five = klines(symbol, "5m")
+    hourly = klines(symbol, "1h", 73)
     micro, current_oi = market_snapshot(symbol, previous_oi)
-    return one, five, micro, current_oi, assess(symbol, one, five, micro, cfg)
+    three_day_high = max(candle.high for candle in hourly) if hourly else one[-1].close
+    drawdown_pct = (one[-1].close / three_day_high - 1.0) * 100.0 if three_day_high > 0 else 0.0
+    last_three = one[-3:]
+    three_candle_reversal = (
+        len(last_three) == 3
+        and all(candle.close > candle.open for candle in last_three)
+        and last_three[0].close < last_three[1].close < last_three[2].close
+    )
+    return one, five, micro, current_oi, assess(symbol, one, five, micro, cfg), drawdown_pct, three_candle_reversal
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -892,6 +901,7 @@ with st.sidebar:
     live = st.toggle("Canlı yenileme", True)
     min_checks = st.slider("Minimum teknik koşul", 1, 8, 6)
     min_confidence = st.slider("Minimum skor", 0, 100, 70, 5)
+    crash_threshold_pct = st.slider("3 günlük düşüş alarmı (%)", 10, 95, 90, 5)
     min_quality_checks = st.slider("Minimum sapma/kalite filtresi", 0, 4, 3)
     min_total_features = st.slider("Minimum toplam özellik", 0, 20, 14)
     max_spread = st.number_input("Maksimum spread (bps)", 0.1, 20.0, 2.0, 0.1)
@@ -996,7 +1006,7 @@ def dashboard() -> None:
                     errors[item] = str(exc)
         if symbol not in packets:
             raise RuntimeError(errors.get(symbol, "seçili sembol verisi yok"))
-        one, five, micro, current_oi, results = packets[symbol]
+        one, five, micro, current_oi, results, selected_drawdown, selected_reversal = packets[symbol]
         for item, packet in packets.items():
             st.session_state.oi[item] = packet[3]
     except Exception as exc:
@@ -1025,7 +1035,7 @@ def dashboard() -> None:
         if packet is None:
             radar_rows.append({"Parite": item, "Durum": "Veri hatası", "Hata": errors.get(item, "-")})
             continue
-        item_one, _, item_micro, _, item_results = packet
+        item_one, _, item_micro, _, item_results, drawdown_pct, three_candle_reversal = packet
         best = max(item_results.values(), key=lambda candidate: candidate.confidence, default=None)
         if best is None:
             continue
@@ -1050,6 +1060,8 @@ def dashboard() -> None:
             "VWAP Δ bps": round(best.vwap_deviation_bps, 2),
             "Z-score": round(best.price_zscore, 2),
             "ATR bps": round(best.atr_bps, 2),
+            "3g zirveden düşüş %": round(drawdown_pct, 2),
+            "3 yeşil mum": "EVET" if three_candle_reversal else "HAYIR",
             "Güncellendi": datetime.now().strftime("%H:%M:%S"),
         })
     for row in radar_rows:
@@ -1069,6 +1081,26 @@ def dashboard() -> None:
         )
     else:
         st.info("Şu anda tüm eşikleri geçen bir parite yok: işlem açmak yerine bekle.")
+    rebound_candidates = []
+    for item in radar_symbols:
+        packet = packets.get(item)
+        if packet is None:
+            continue
+        _, _, _, _, item_results, drawdown_pct, three_candle_reversal = packet
+        if drawdown_pct <= -float(crash_threshold_pct) and three_candle_reversal:
+            best = max(item_results.values(), key=lambda candidate: candidate.confidence, default=None)
+            if best is not None:
+                rebound_candidates.append((item, drawdown_pct, best))
+    if rebound_candidates:
+        rebound_candidates.sort(key=lambda item: (item[1], -item[2].confidence))
+        coin, drawdown, rebound_signal = rebound_candidates[0]
+        st.warning(
+            f"Kapitülasyon dönüş adayı: {coin} · 3 günlük zirveden {drawdown:.2f}% · "
+            f"son 3 mum yeşil/yükselen · algoritma yönü {rebound_signal.side} · skor {rebound_signal.confidence}/100. "
+            "%90 düşüş çok yüksek risk, delist ve likidite problemi gösterebilir."
+        )
+    else:
+        st.caption(f"3 günlük zirveden en az %{crash_threshold_pct} düşüp son üç 1m mumu yükselen coin bulunmadı.")
     if errors:
         with st.expander("Radar veri hataları"):
             st.json(errors)
