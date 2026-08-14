@@ -677,6 +677,7 @@ class FuturesClient:
 
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -755,6 +756,29 @@ def score_label(score: int) -> str:
     return "⚪ NO SIGNAL"
 
 
+def scan_symbol(symbol: str, cfg: Settings, previous_oi: float | None):
+    one = klines(symbol, "1m")
+    five = klines(symbol, "5m")
+    micro, current_oi = market_snapshot(symbol, previous_oi)
+    return one, five, micro, current_oi, assess(symbol, one, five, micro, cfg)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def futures_catalog() -> list[str]:
+    """All currently trading USDT perpetual symbols, ranked by 24h quote volume."""
+    exchange = get_json("/fapi/v1/exchangeInfo", {})
+    active = {
+        item["symbol"]
+        for item in exchange.get("symbols", [])
+        if item.get("status") == "TRADING"
+        and item.get("contractType") == "PERPETUAL"
+        and item.get("quoteAsset") == "USDT"
+    }
+    tickers = get_json("/fapi/v1/ticker/24hr", {})
+    volumes = {item["symbol"]: float(item.get("quoteVolume", 0)) for item in tickers if item.get("symbol") in active}
+    return sorted(active, key=lambda item: volumes.get(item, 0.0), reverse=True)
+
+
 def render_signal(signal: Signal, eligible: bool) -> None:
     st.subheader(f"{signal.side} · {score_label(signal.confidence)}")
     a, b, c, d = st.columns(4)
@@ -804,7 +828,22 @@ st.markdown(
 with st.sidebar:
     st.caption("🤖 BOT CONTROL")
     st.header("Ayarlar")
-    symbol = st.text_input("Sembol", "BTCUSDT").upper().replace("/", "").strip()
+    try:
+        all_symbols = futures_catalog()
+    except Exception as exc:
+        st.warning(f"Parite kataloğu alınamadı; temel liste kullanılıyor: {exc}")
+        all_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
+    symbol = st.selectbox("Detay paritesi", all_symbols, index=0)
+    default_radar = all_symbols[: min(5, len(all_symbols))]
+    selected_radar_symbols = st.multiselect(
+        f"Radar pariteleri · {len(all_symbols)} aktif USDT perpetual",
+        all_symbols,
+        default=default_radar,
+        help="Liste 24 saatlik hacme göre sıralanır. Tüm aktif pariteler seçilebilir.",
+    )
+    if len(selected_radar_symbols) > 20:
+        st.warning("API yükünü sınırlamak için ilk 20 seçili parite taranacak.")
+    radar_symbols = selected_radar_symbols[:20]
     refresh_seconds = st.slider("Yenileme (saniye)", 5, 60, 15, 5)
     live = st.toggle("Canlı yenileme", True)
     min_checks = st.slider("Minimum teknik koşul", 1, 8, 6)
@@ -886,12 +925,23 @@ run_every = refresh_seconds if live else None
 
 @st.fragment(run_every=run_every)
 def dashboard() -> None:
+    symbols_to_scan = list(dict.fromkeys([symbol, *radar_symbols]))
+    packets = {}
+    errors = {}
     try:
-        one = klines(symbol, "1m")
-        five = klines(symbol, "5m")
-        micro, current_oi = market_snapshot(symbol, st.session_state.oi.get(symbol))
-        st.session_state.oi[symbol] = current_oi
-        results = assess(symbol, one, five, micro, cfg)
+        with ThreadPoolExecutor(max_workers=min(6, len(symbols_to_scan))) as pool:
+            future_map = {pool.submit(scan_symbol, item, cfg, st.session_state.oi.get(item)): item for item in symbols_to_scan}
+            for future in as_completed(future_map):
+                item = future_map[future]
+                try:
+                    packets[item] = future.result()
+                except Exception as exc:
+                    errors[item] = str(exc)
+        if symbol not in packets:
+            raise RuntimeError(errors.get(symbol, "seçili sembol verisi yok"))
+        one, five, micro, current_oi, results = packets[symbol]
+        for item, packet in packets.items():
+            st.session_state.oi[item] = packet[3]
     except Exception as exc:
         st.error(f"Binance verisi alınamadı: {exc}")
         return
@@ -903,6 +953,58 @@ def dashboard() -> None:
     top4.metric("Güncelleme", datetime.now().strftime("%H:%M:%S"))
     chart = pd.DataFrame({"Fiyat": [c.close for c in one[-100:]]}, index=pd.to_datetime([c.open_time for c in one[-100:]], unit="ms"))
     st.line_chart(chart, height=260)
+
+    st.subheader("🛰️ Çoklu Coin Fırsat Radarı")
+    radar_rows = []
+    eligible_candidates = []
+    for item in radar_symbols:
+        packet = packets.get(item)
+        if packet is None:
+            radar_rows.append({"Parite": item, "Durum": "Veri hatası", "Hata": errors.get(item, "-")})
+            continue
+        item_one, _, item_micro, _, item_results = packet
+        best = max(item_results.values(), key=lambda candidate: candidate.confidence, default=None)
+        if best is None:
+            continue
+        eligible = (
+            best.base_passed >= cfg.min_base_checks
+            and best.quality_passed >= cfg.min_quality_checks
+            and best.total_passed >= cfg.min_total_features
+            and best.confidence >= cfg.min_confidence
+        )
+        if eligible:
+            eligible_candidates.append(best)
+        radar_rows.append({
+            "Parite": item,
+            "Fiyat": item_one[-1].close,
+            "Yön": best.side,
+            "Skor": best.confidence,
+            "Özellik": f"{best.total_passed}/20",
+            "Sinyal": "UYGUN" if eligible else "BEKLE",
+            "Spread bps": round(item_micro.spread_bps, 2),
+            "Order Book": round(item_micro.imbalance, 3),
+            "OI %": None if item_micro.oi_change_pct is None else round(item_micro.oi_change_pct, 4),
+            "VWAP Δ bps": round(best.vwap_deviation_bps, 2),
+            "Z-score": round(best.price_zscore, 2),
+            "ATR bps": round(best.atr_bps, 2),
+        })
+    if radar_rows:
+        radar_frame = pd.DataFrame(radar_rows)
+        if "Skor" in radar_frame.columns:
+            radar_frame = radar_frame.sort_values("Skor", ascending=False, na_position="last")
+        st.dataframe(radar_frame, hide_index=True, use_container_width=True, height=min(390, 42 + len(radar_frame) * 36))
+    if eligible_candidates:
+        recommendation = max(eligible_candidates, key=lambda candidate: (candidate.confidence, candidate.total_passed, -candidate.spread_bps))
+        st.success(
+            f"Algoritmik olarak en güçlü aday: {recommendation.symbol} · {recommendation.side} · "
+            f"{recommendation.confidence}/100 · {recommendation.total_passed}/20 özellik. "
+            "Bu bir yatırım tavsiyesi değil; emirden önce risk büyüklüğünü ve piyasa koşullarını kontrol edin."
+        )
+    else:
+        st.info("Şu anda tüm eşikleri geçen bir parite yok: işlem açmak yerine bekle.")
+    if errors:
+        with st.expander("Radar veri hataları"):
+            st.json(errors)
 
     long_tab, short_tab = st.tabs(["LONG", "SHORT"])
     eligible_signals = []
