@@ -901,7 +901,7 @@ with st.sidebar:
     live = st.toggle("Canlı yenileme", True)
     min_checks = st.slider("Minimum teknik koşul", 1, 8, 6)
     min_confidence = st.slider("Minimum skor", 0, 100, 70, 5)
-    crash_threshold_pct = st.slider("3 günlük düşüş alarmı (%)", 10, 95, 90, 5)
+    crash_threshold_pct = st.slider("3 günlük düşüş alarmı (%)", 10, 95, 70, 5)
     min_quality_checks = st.slider("Minimum sapma/kalite filtresi", 0, 4, 3)
     min_total_features = st.slider("Minimum toplam özellik", 0, 20, 14)
     max_spread = st.number_input("Maksimum spread (bps)", 0.1, 20.0, 2.0, 0.1)
@@ -1097,7 +1097,7 @@ def dashboard() -> None:
         st.warning(
             f"Kapitülasyon dönüş adayı: {coin} · 3 günlük zirveden {drawdown:.2f}% · "
             f"son 3 mum yeşil/yükselen · algoritma yönü {rebound_signal.side} · skor {rebound_signal.confidence}/100. "
-            "%90 düşüş çok yüksek risk, delist ve likidite problemi gösterebilir."
+            "%70+ düşüş çok yüksek risk, delist ve likidite problemi gösterebilir."
         )
     else:
         st.caption(f"3 günlük zirveden en az %{crash_threshold_pct} düşüp son üç 1m mumu yükselen coin bulunmadı.")
