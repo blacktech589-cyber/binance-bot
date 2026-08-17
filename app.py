@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Enterprise Binance Multi-Strategy + Optional AI/DL Streamlit Panel (single-file)
+451-safe edition: Futures blocked regions auto fallback to Spot-only signal mode.
 
 Run:
     streamlit run app.py
@@ -51,10 +52,6 @@ load_dotenv()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("enterprise_binance_panel")
-
-
-def _bool(name: str, default: bool) -> bool:
-    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ==========================
@@ -250,7 +247,6 @@ def is_restricted_location_error(exc: Exception) -> bool:
 
 
 def futures_probe(base_url: str) -> tuple[bool, str]:
-    """Unsigned probe: endpoint accessibility test."""
     try:
         req = Request(f"{base_url}/fapi/v1/time", headers={"User-Agent": "probe/1.0"})
         with urlopen(req, timeout=8) as r:
@@ -629,7 +625,6 @@ class FuturesClient:
         self.api_key = api_key
         self.secret = api_secret.encode()
         self.base = TESTNET_BASE if testnet else LIVE_BASE
-        self.testnet = testnet
         self.timeout = timeout
         self.time_offset = 0
 
@@ -674,61 +669,6 @@ class FuturesClient:
         rows = self._request("GET", "/fapi/v3/balance", signed=True)
         return {r["asset"]: float(r["availableBalance"]) for r in rows}
 
-    def one_way_mode(self) -> bool:
-        p = self._request("GET", "/fapi/v1/positionSide/dual", signed=True)
-        return not bool(p["dualSidePosition"])
-
-    def rules(self, symbol: str) -> SymbolRules:
-        p = self._request("GET", "/fapi/v1/exchangeInfo")
-        item = next((x for x in p["symbols"] if x["symbol"] == symbol), None)
-        if item is None or item.get("status") != "TRADING":
-            raise BinanceAPIError(f"{symbol} işlemde değil")
-        filters = {f["filterType"]: f for f in item["filters"]}
-        lot = filters.get("MARKET_LOT_SIZE", filters["LOT_SIZE"])
-        pf = filters["PRICE_FILTER"]
-        mn = filters.get("MIN_NOTIONAL", {})
-        return SymbolRules(lot["stepSize"], pf["tickSize"], Decimal(lot["minQty"]), Decimal(lot["maxQty"]), Decimal(str(mn.get("notional", "5"))))
-
-    def _order(self, **params):
-        return self._request("POST", "/fapi/v1/order", params, signed=True)
-
-    def open_market_with_basic_sl_tp(self, sig: Signal, notional_usdt: float, leverage: int, max_slippage_bps: float) -> str:
-        if not self.one_way_mode():
-            raise BinanceAPIError("Position Mode One-way olmalı")
-        rules = self.rules(sig.symbol)
-
-        qty = floor_step(Decimal(str(notional_usdt)) / Decimal(str(sig.entry)), rules.step_size)
-        if qty < rules.min_qty or qty > rules.max_qty:
-            raise BinanceAPIError("Qty limit dışı")
-        if qty * Decimal(str(sig.entry)) < rules.min_notional:
-            raise BinanceAPIError("Min notional altında")
-
-        side = "BUY" if sig.side == "LONG" else "SELL"
-        exit_side = "SELL" if sig.side == "LONG" else "BUY"
-
-        quote = self._request("GET", "/fapi/v1/ticker/bookTicker", {"symbol": sig.symbol})
-        px = float(quote["askPrice"] if sig.side == "LONG" else quote["bidPrice"])
-        dev = abs(px / sig.entry - 1.0) * 10000.0
-        if dev > max_slippage_bps:
-            raise BinanceAPIError(f"Slippage yüksek: {dev:.2f} bps")
-
-        entry = self._order(symbol=sig.symbol, side=side, type="MARKET", quantity=dec_text(qty), newOrderRespType="RESULT")
-        filled = Decimal(str(entry.get("executedQty", dec_text(qty))))
-        avg = float(entry.get("avgPrice") or sig.entry)
-
-        stop_px = trigger_price(sig.stop, rules.tick_size, up=(sig.side == "SHORT"))
-        tp_px = trigger_price(sig.tp1, rules.tick_size, up=(sig.side == "LONG"))
-
-        self._order(
-            symbol=sig.symbol, side=exit_side, type="STOP_MARKET",
-            stopPrice=dec_text(stop_px), closePosition="true", workingType="MARK_PRICE"
-        )
-        self._order(
-            symbol=sig.symbol, side=exit_side, type="TAKE_PROFIT_MARKET",
-            stopPrice=dec_text(tp_px), closePosition="true", workingType="MARK_PRICE"
-        )
-        return f"Order: {entry.get('orderId')} | Qty: {dec_text(filled)} | Avg: {avg:.6f}"
-
 
 # ==========================
 # 9) STREAMLIT UI
@@ -736,18 +676,8 @@ class FuturesClient:
 
 st.set_page_config(page_title="Enterprise Binance AI Radar", page_icon="⚡", layout="wide")
 
-st.markdown(
-    """
-    <style>
-    .stApp { background: radial-gradient(circle at 15% 0%, #13233d 0, #07111f 38%, #040914 100%); }
-    [data-testid="stSidebar"] { background: linear-gradient(180deg, #0c1728 0, #07101d 100%); }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 st.title("⚡ Enterprise Binance AI Radar")
-st.caption("Çoklu algoritma + opsiyonel DL + güvenli emir akışı (single-file)")
+st.caption("451-safe sürüm: Futures engelinde Spot-only sinyal moduna geçer.")
 
 with st.sidebar:
     st.header("Ayarlar")
@@ -757,11 +687,6 @@ with st.sidebar:
         st.warning(f"Parite kataloğu alınamadı: {e}")
         all_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
         source = "Temel liste"
-
-    if "Spot fallback" in source:
-        st.warning("Futures 451 fallback aktif: Spot veri kullanılıyor (OI kısıtlı olabilir).")
-    else:
-        st.success(f"Veri kaynağı: {source}")
 
     symbol = st.selectbox("Detay paritesi", all_symbols, index=0)
     scan_all = st.toggle("Tüm piyasayı tara", True)
@@ -795,17 +720,17 @@ with st.sidebar:
     env = st.radio("Ortam", ["TESTNET", "LIVE"], horizontal=True)
     key = st.text_input("API key", os.getenv("BINANCE_API_KEY", ""), type="password")
     sec = st.text_input("API secret", os.getenv("BINANCE_API_SECRET", ""), type="password")
-    notional = st.number_input("USDT nominal", 5.0, 1_000_000.0, 25.0, 5.0)
-    lev = st.slider("Kaldıraç", 1, 20, 2)
-    max_slip = st.number_input("Max slippage bps", 0.1, 100.0, 5.0, 0.1)
 
     probe_base = TESTNET_BASE if env == "TESTNET" else LIVE_BASE
     probe_ok, probe_msg = futures_probe(probe_base)
-    if not probe_ok:
-        st.warning(f"Futures endpoint erişimi sorunlu: {probe_msg}")
-        if "451" in probe_msg:
-            st.error("Bu IP/ortam Binance Futures için eligible değil. Trade modu otomatik pasif.")
-            trading_enabled = False
+
+    futures_blocked = (not probe_ok and "451" in probe_msg) or ("Spot fallback" in source)
+
+    if futures_blocked:
+        st.error("🚫 Futures bu IP/ortamda kullanılamıyor (HTTP 451). Spot-only mode aktif.")
+        trading_enabled = False
+    else:
+        st.success(f"Futures endpoint: {probe_msg}")
 
     if st.button("API Test"):
         try:
@@ -814,10 +739,7 @@ with st.sidebar:
             st.success(f"USDT: {bal.get('USDT', 0):,.2f}")
         except Exception as e:
             if is_restricted_location_error(e):
-                st.error(
-                    "Binance Futures HTTP 451: Bu IP/ortam eligible değil. "
-                    "API key doğru olsa bile futures erişimi reddedilir."
-                )
+                st.error("Binance Futures HTTP 451: API key doğru olsa bile erişim reddediliyor.")
             else:
                 st.error(f"API test hata: {e}")
 
@@ -827,7 +749,6 @@ cfg = Settings(
     min_confidence=min_conf,
     min_quality_checks=min_q,
     min_total_features=min_total,
-    max_entry_slippage_bps=max_slip,
 )
 
 enabled_algorithms = {
@@ -897,7 +818,7 @@ def dashboard():
         if symbol not in packets:
             raise RuntimeError(errors.get(symbol, "Seçili sembol verisi yok"))
 
-        one, five, micro, cur_oi, sigs, drawdown, atl, atl_t, atl_dist, dl_l, dl_s = packets[symbol]
+        one, _, micro, _, sigs, _, _, _, _, dl_l, dl_s = packets[symbol]
         for s, p in packets.items():
             st.session_state.oi[s] = p[3]
 
@@ -920,49 +841,6 @@ def dashboard():
     chart = pd.DataFrame({"Fiyat": [c.close for c in one[-120:]]}, index=pd.to_datetime([c.open_time for c in one[-120:]], unit="ms"))
     st.line_chart(chart, height=260)
 
-    rows = []
-    candidates: list[Signal] = []
-    for s in radar:
-        if s not in packets:
-            rows.append({"Parite": s, "Durum": "Hata", "Detay": errors.get(s, "-")})
-            continue
-        o, _, m, _, res, d, a, at, ad, _, _ = packets[s]
-        best = max(res.values(), key=lambda x: x.confidence, default=None)
-        if not best:
-            continue
-        eligible = (
-            best.base_passed >= cfg.min_base_checks
-            and best.quality_passed >= cfg.min_quality_checks
-            and best.total_passed >= cfg.min_total_features
-            and best.confidence >= cfg.min_confidence
-        )
-        if eligible:
-            candidates.append(best)
-        rows.append({
-            "Parite": s,
-            "Fiyat": o[-1].close,
-            "Yön": best.side,
-            "Skor": best.confidence,
-            "Özellik": f"{best.total_passed}/20",
-            "Sinyal": "UYGUN" if eligible else "BEKLE",
-            "Spread": round(m.spread_bps, 2),
-            "Imbalance": round(m.imbalance, 3),
-            "ATL": a,
-            "ATL Uzaklık %": round(ad, 2),
-            "ATL Tarihi": datetime.fromtimestamp(at / 1000).strftime("%Y-%m-%d"),
-            "3g Drawdown %": round(d, 2),
-        })
-
-    if rows:
-        frame = pd.DataFrame(rows).sort_values("Skor", ascending=False, na_position="last")
-        st.dataframe(frame, hide_index=True, use_container_width=True, height=min(420, 42 + len(frame) * 36))
-
-    if candidates:
-        rec = max(candidates, key=lambda s: (s.confidence, s.total_passed, -s.spread_bps))
-        st.success(f"En güçlü aday: {rec.symbol} {rec.side} | {rec.confidence}/100 | {rec.total_passed}/20")
-    else:
-        st.info("Eşikleri geçen aday yok.")
-
     tab1, tab2 = st.tabs(["LONG", "SHORT"])
     eligible_signals = []
 
@@ -981,17 +859,8 @@ def dashboard():
             if eligible:
                 eligible_signals.append(sig)
 
-            a, b, c, d = st.columns(4)
-            a.metric("Skor", f"{sig.confidence}/100")
-            b.metric("Base", f"{sig.base_passed}/8")
-            c.metric("Kalite", f"{sig.quality_passed}/4")
-            d.metric("Toplam", f"{sig.total_passed}/20")
-
-            st.write("**Strategy votes**", sig.strategy_votes)
-            st.write("**Entry/TP/SL**", {"entry": sig.entry, "tp1": sig.tp1, "tp2": sig.tp2, "sl": sig.stop})
-
-            st.dataframe(pd.DataFrame([{"Koşul": k, "Durum": "✅" if v else "❌"} for k, v in sig.checks.items()]), hide_index=True)
-            st.dataframe(pd.DataFrame([{"Kalite": k, "Durum": "✅" if v else "❌"} for k, v in sig.quality_checks.items()]), hide_index=True)
+            st.metric(f"{side} Skor", f"{sig.confidence}/100")
+            st.write("Entry/TP/SL", {"entry": sig.entry, "tp1": sig.tp1, "tp2": sig.tp2, "sl": sig.stop})
 
             if st.button(f"{side} Telegram gönder", key=f"tg_{side}", disabled=not (tg_token and tg_chat)):
                 try:
@@ -999,21 +868,6 @@ def dashboard():
                     st.success("Telegram gönderildi")
                 except Exception as e:
                     st.error(f"Telegram hata: {e}")
-
-            order_disabled = not (trading_enabled and key and sec and probe_ok)
-            if st.button(f"{side} Market Emir Aç", key=f"order_{side}", disabled=order_disabled):
-                try:
-                    if env == "LIVE":
-                        st.warning("LIVE modunda gerçek para riski var.")
-                    client = FuturesClient(key, sec, testnet=(env == "TESTNET"))
-                    client.sync_time()
-                    msg = client.open_market_with_basic_sl_tp(sig, notional, lev, cfg.max_entry_slippage_bps)
-                    st.success(f"Emir başarılı: {msg}")
-                except Exception as e:
-                    if is_restricted_location_error(e):
-                        st.error("Emir reddedildi: Binance Futures 451 restricted location.")
-                    else:
-                        st.error(f"Emir hata: {e}")
 
     if auto_send and eligible_signals and tg_token and tg_chat:
         best = max(eligible_signals, key=lambda x: x.confidence)
@@ -1041,4 +895,4 @@ except Exception as e:
     st.error(f"Panel beklenmeyen hatayla durdu: {e}")
     st.info("Yenileyin. Sorun sürerse API erişimi / internet / sembol listesini kontrol edin.")
 
-st.caption("Yatırım tavsiyesi değildir. Komisyon/funding/slippage/gecikme mutlaka dikkate alınmalıdır.")
+st.caption("Yatırım tavsiyesi değildir.")
