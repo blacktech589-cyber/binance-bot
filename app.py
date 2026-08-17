@@ -263,6 +263,35 @@ def format_signal(s: dict, interval: str) -> str:
     )
 
 
+def format_recommendations(signals: list[dict], interval: str, top_n: int) -> str:
+    """En güçlü adayları tek Telegram mesajında sıralar."""
+    if not signals:
+        return (
+            "🔎 OTOMATİK COİN TARAMASI\n\n"
+            f"Zaman aralığı: {interval}\n"
+            "Şu anda bütün risk ve trend filtrelerini geçen aday yok.\n\n"
+            "⚠️ Sinyal olmaması da bir sonuçtur; filtreler otomatik gevşetilmedi."
+        )
+    lines = [
+        "📊 OTOMATİK COİN İZLEME LİSTESİ",
+        "",
+        f"Zaman aralığı: {interval}",
+        f"Uygun aday: {len(signals)}",
+        "",
+    ]
+    for rank, s in enumerate(signals[:top_n], 1):
+        lines.extend([
+            f"{rank}) {s['symbol']} — {s['score']}/100",
+            f"   Kapanış: {s['entry']:.10g}",
+            f"   Stop: {s['stop']:.10g}",
+            f"   Hedef: {s['target1']:.10g} / {s['target2']:.10g}",
+            f"   RSI {s['rsi']:.1f} | ADX {s['adx']:.1f} | Hacim {s['volume_ratio']:.2f}x",
+            "",
+        ])
+    lines.append("⚠️ İzleme listesi yatırım tavsiyesi veya otomatik alım emri değildir.")
+    return "\n".join(lines)
+
+
 def load_state(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -302,7 +331,16 @@ def scan_once(args) -> list[dict]:
         except Exception as exc:
             print(f"Uyarı - {symbol} atlandı: {exc}")
         time.sleep(args.symbol_delay)
-    return sorted(signals, key=lambda x: x["score"], reverse=True)
+    signals = sorted(signals, key=lambda x: (x["score"], x["volume_ratio"]), reverse=True)
+    if args.send_digest:
+        digest_key = "__digest__"
+        last_digest = float(state.get(digest_key, 0))
+        if now - last_digest >= args.digest_cooldown_hours * 3600:
+            telegram_send(format_recommendations(signals, args.interval, args.top_recommendations))
+            state[digest_key] = now
+            save_state(state_path, state)
+            print("Telegram sıralı coin özeti gönderildi.")
+    return signals
 
 
 def main():
@@ -318,6 +356,9 @@ def main():
     p.add_argument("--state-file", default="signal_state.json")
     p.add_argument("--account-check", action="store_true")
     p.add_argument("--telegram-test", action="store_true")
+    p.add_argument("--send-digest", action="store_true", help="En iyi coinleri sıralı Telegram özetiyle gönder")
+    p.add_argument("--top-recommendations", type=int, default=5)
+    p.add_argument("--digest-cooldown-hours", type=float, default=6.0)
     args = p.parse_args()
     args.candles = max(500, min(args.candles, 10_000))
 
