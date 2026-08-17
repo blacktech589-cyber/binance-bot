@@ -6,6 +6,7 @@ import json
 import math
 import hmac
 import html
+import time
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,8 +37,15 @@ def load_dotenv(path: str = ".env") -> None:
 load_dotenv()
 
 FAPI = os.getenv("BINANCE_FUTURES_REST", "https://fapi.binance.com")
-SPOT = os.getenv("BINANCE_SPOT_REST", "https://api.binance.com")
 FORCE_SPOT = os.getenv("FORCE_SPOT", "1") == "1"
+
+SPOT_ENDPOINTS = [
+    os.getenv("BINANCE_SPOT_REST", "https://api.binance.com"),
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://data-api.binance.vision",
+]
 
 
 # ---------------- HTTP ----------------
@@ -47,6 +55,25 @@ def req_json(base: str, path: str, params: dict | None = None, timeout: float = 
     req = Request(url, headers={"User-Agent": "enterprise-signal-panel/2.0"})
     with urlopen(req, timeout=timeout) as r:
         return json.load(r)
+
+
+def req_json_multi(
+    bases: list[str],
+    path: str,
+    params: dict | None = None,
+    timeout: float = 15.0,
+    retries_per_base: int = 1,
+):
+    last_err = None
+    for b in bases:
+        for _ in range(retries_per_base + 1):
+            try:
+                return req_json(b, path, params=params, timeout=timeout), b
+            except Exception as e:
+                last_err = e
+                time.sleep(0.2)
+                continue
+    raise last_err
 
 
 def is_451(exc: Exception) -> bool:
@@ -236,7 +263,7 @@ def fetch_klines_paged(base: str, path: str, symbol: str, interval: str, total_l
     out = []
     end_time = None
     remaining = total_limit
-    step = 1500  # Binance max
+    step = 1000  # safer for spot reliability
     while remaining > 0:
         lim = min(step, remaining)
         p = {"symbol": symbol, "interval": interval, "limit": lim}
@@ -251,7 +278,7 @@ def fetch_klines_paged(base: str, path: str, symbol: str, interval: str, total_l
         remaining -= len(rows)
         if len(rows) < lim:
             break
-    # dedupe by open time
+
     uniq = {}
     for r in out:
         uniq[int(r[0])] = r
@@ -260,18 +287,38 @@ def fetch_klines_paged(base: str, path: str, symbol: str, interval: str, total_l
 
 # ---------------- Data fetch ----------------
 def fetch_klines(symbol: str, interval: str, limit: int = 10000) -> list[Candle]:
+    rows = None
+
     if FORCE_SPOT:
-        rows = fetch_klines_paged(SPOT, "/api/v3/klines", symbol, interval, total_limit=limit)
+        last_err = None
+        for b in SPOT_ENDPOINTS:
+            try:
+                rows = fetch_klines_paged(b, "/api/v3/klines", symbol, interval, total_limit=limit)
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if rows is None:
+            raise last_err
     else:
         try:
             rows = fetch_klines_paged(FAPI, "/fapi/v1/klines", symbol, interval, total_limit=limit)
         except HTTPError as e:
             if not is_451(e):
                 raise
-            rows = fetch_klines_paged(SPOT, "/api/v3/klines", symbol, interval, total_limit=limit)
+            last_err = None
+            for b in SPOT_ENDPOINTS:
+                try:
+                    rows = fetch_klines_paged(b, "/api/v3/klines", symbol, interval, total_limit=limit)
+                    break
+                except Exception as e2:
+                    last_err = e2
+                    continue
+            if rows is None:
+                raise last_err
 
     if len(rows) > 1:
-        rows = rows[:-1]  # last incomplete candle
+        rows = rows[:-1]
 
     return [
         Candle(
@@ -289,8 +336,8 @@ def fetch_klines(symbol: str, interval: str, limit: int = 10000) -> list[Candle]
 
 def fetch_micro(symbol: str, prev_oi: float | None) -> tuple[Micro, float | None]:
     if FORCE_SPOT:
-        d = req_json(SPOT, "/api/v3/depth", {"symbol": symbol, "limit": 20})
-        t = req_json(SPOT, "/api/v3/ticker/bookTicker", {"symbol": symbol})
+        d, _ = req_json_multi(SPOT_ENDPOINTS, "/api/v3/depth", {"symbol": symbol, "limit": 20})
+        t, _ = req_json_multi(SPOT_ENDPOINTS, "/api/v3/ticker/bookTicker", {"symbol": symbol})
         oi_now = None
     else:
         try:
@@ -300,8 +347,8 @@ def fetch_micro(symbol: str, prev_oi: float | None) -> tuple[Micro, float | None
         except HTTPError as e:
             if not is_451(e):
                 raise
-            d = req_json(SPOT, "/api/v3/depth", {"symbol": symbol, "limit": 20})
-            t = req_json(SPOT, "/api/v3/ticker/bookTicker", {"symbol": symbol})
+            d, _ = req_json_multi(SPOT_ENDPOINTS, "/api/v3/depth", {"symbol": symbol, "limit": 20})
+            t, _ = req_json_multi(SPOT_ENDPOINTS, "/api/v3/ticker/bookTicker", {"symbol": symbol})
             oi_now = None
 
     bid_qty = sum(float(x[1]) for x in d["bids"])
@@ -314,8 +361,9 @@ def fetch_micro(symbol: str, prev_oi: float | None) -> tuple[Micro, float | None
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_symbols() -> tuple[list[str], str]:
-    if FORCE_SPOT:
-        ex = req_json(SPOT, "/api/v3/exchangeInfo", {})
+    spot_err = "unknown"
+    try:
+        ex, base_used = req_json_multi(SPOT_ENDPOINTS, "/api/v3/exchangeInfo", {})
         active = {
             s["symbol"]
             for s in ex.get("symbols", [])
@@ -323,37 +371,21 @@ def load_symbols() -> tuple[list[str], str]:
             and s.get("quoteAsset") == "USDT"
             and s.get("isSpotTradingAllowed", True)
         }
-        tk = req_json(SPOT, "/api/v3/ticker/24hr", {})
-        source = "Spot (forced)"
-    else:
-        try:
-            ex = req_json(FAPI, "/fapi/v1/exchangeInfo", {})
-            active = {
-                s["symbol"]
-                for s in ex.get("symbols", [])
-                if s.get("status") == "TRADING"
-                and s.get("contractType") == "PERPETUAL"
-                and s.get("quoteAsset") == "USDT"
-            }
-            tk = req_json(FAPI, "/fapi/v1/ticker/24hr", {})
-            source = "Futures"
-        except HTTPError as e:
-            if not is_451(e):
-                raise
-            ex = req_json(SPOT, "/api/v3/exchangeInfo", {})
-            active = {
-                s["symbol"]
-                for s in ex.get("symbols", [])
-                if s.get("status") == "TRADING"
-                and s.get("quoteAsset") == "USDT"
-                and s.get("isSpotTradingAllowed", True)
-            }
-            tk = req_json(SPOT, "/api/v3/ticker/24hr", {})
-            source = "Spot fallback (Futures 451)"
+        tk, _ = req_json_multi(SPOT_ENDPOINTS, "/api/v3/ticker/24hr", {})
+        source = f"Spot ({base_used})"
 
-    vol = {x["symbol"]: float(x.get("quoteVolume", 0)) for x in tk if x.get("symbol") in active}
-    ordered = sorted(active, key=lambda s: vol.get(s, 0.0), reverse=True)
-    return ordered, source
+        vol = {x["symbol"]: float(x.get("quoteVolume", 0)) for x in tk if x.get("symbol") in active}
+        ordered = sorted(active, key=lambda s: vol.get(s, 0.0), reverse=True)
+        if ordered:
+            return ordered, source
+    except Exception as e:
+        spot_err = str(e)
+
+    fallback = [
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+        "ADAUSDT", "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "LINKUSDT"
+    ]
+    return fallback, f"Fallback symbols (Spot erişim hatası: {spot_err[:120]})"
 
 
 # ---------------- 50 Features ----------------
@@ -369,7 +401,6 @@ def build_50_features(one: list[Candle], five: list[Candle], micro: Micro) -> di
     l5 = [x.low for x in five]
     v5 = [x.volume for x in five]
 
-    # base indicators
     ema9 = ema(c, 9)
     ema20 = ema(c, 20)
     ema50 = ema(c, 50)
@@ -385,12 +416,10 @@ def build_50_features(one: list[Candle], five: list[Candle], micro: Micro) -> di
 
     feats: dict[str, float] = {}
 
-    # 1-10 returns
     horizons = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
-    for i, n in enumerate(horizons, start=1):
+    for n in horizons:
         feats[f"ret_{n}"] = pct_change(c[-1], c[-1 - n]) if len(c) > n else 0.0
 
-    # 11-15 candle structure
     last_range = (h[-1] - l[-1]) if h[-1] != l[-1] else 1e-9
     feats["body_ratio"] = abs(c[-1] - o[-1]) / last_range
     feats["upper_wick_ratio"] = (h[-1] - max(c[-1], o[-1])) / last_range
@@ -398,7 +427,6 @@ def build_50_features(one: list[Candle], five: list[Candle], micro: Micro) -> di
     feats["close_pos_in_range"] = (c[-1] - l[-1]) / last_range
     feats["hl_spread_pct"] = pct_change(h[-1], l[-1])
 
-    # 16-22 MA distances/slopes
     feats["dist_ema9"] = pct_change(c[-1], ema9[-1])
     feats["dist_ema20"] = pct_change(c[-1], ema20[-1])
     feats["dist_ema50"] = pct_change(c[-1], ema50[-1])
@@ -407,7 +435,6 @@ def build_50_features(one: list[Candle], five: list[Candle], micro: Micro) -> di
     feats["slope_ema50_5"] = pct_change(ema50[-1], ema50[-6]) if len(ema50) > 6 else 0.0
     feats["ema20_over_50"] = pct_change(ema20[-1], ema50[-1])
 
-    # 23-28 oscillators
     feats["rsi7"] = rsi7[-1] / 100.0
     feats["rsi14"] = rsi14[-1] / 100.0
     feats["rsi_delta"] = (rsi14[-1] - rsi14[-4]) / 100.0 if len(rsi14) > 4 else 0.0
@@ -415,7 +442,6 @@ def build_50_features(one: list[Candle], five: list[Candle], micro: Micro) -> di
     feats["macdh_delta"] = (macdh[-1] - macdh[-2]) if len(macdh) > 1 else 0.0
     feats["z20"] = z20
 
-    # 29-34 volatility/range
     feats["atr14_pct"] = atr14 / c[-1] if c[-1] else 0.0
     feats["range20_pct"] = pct_change(max(h[-20:]), min(l[-20:])) if len(h) >= 20 else 0.0
     feats["std20_ret"] = float(pd.Series(c).pct_change().tail(20).std() or 0.0)
@@ -427,7 +453,6 @@ def build_50_features(one: list[Candle], five: list[Candle], micro: Micro) -> di
         if len(c) > 21 else 1.0
     )
 
-    # 35-40 volume/taker
     feats["vol_ratio_20"] = v[-1] / (mean_v20 + 1e-9)
     feats["vol_ratio_50"] = v[-1] / (mean_v50 + 1e-9)
     feats["vol_trend_5"] = (sum(v[-5:]) / 5) / ((sum(v[-20:]) / 20) + 1e-9) if len(v) >= 20 else 1.0
@@ -438,14 +463,12 @@ def build_50_features(one: list[Candle], five: list[Candle], micro: Micro) -> di
     )
     feats["vwap_dev_bps"] = ((c[-1] / vw20) - 1.0) * 10000.0 if vw20 > 0 else 0.0
 
-    # 41-45 microstructure
     feats["spread_bps"] = micro.spread_bps
     feats["imbalance"] = micro.imbalance
     feats["oi_change_pct"] = micro.oi_change_pct if micro.oi_change_pct is not None else 0.0
     feats["mid_move_1"] = pct_change((micro.bid + micro.ask) / 2.0, c[-2]) if len(c) > 2 else 0.0
     feats["book_pressure"] = micro.imbalance / (micro.spread_bps + 1e-9)
 
-    # 46-50 multi-timeframe coherence
     ema20_5 = ema(c5, 20)
     ema50_5 = ema(c5, 50)
     rsi5 = rsi(c5, 14)
@@ -463,11 +486,9 @@ def dl_bonus_from_features(features: dict[str, float], side: str, enabled: bool)
     if not enabled:
         return 0.0, 0.5, "DL kapalı"
 
-    # feature normalization helpers
     def clip(x, lo, hi):
         return max(lo, min(hi, x))
 
-    # pseudo-model (lightweight logistic score from 50 features)
     x = features
     score_raw = 0.0
     score_raw += clip(x["ret_3"] * 120, -3, 3) * 0.10
@@ -483,7 +504,7 @@ def dl_bonus_from_features(features: dict[str, float], side: str, enabled: bool)
 
     p_long = 1.0 / (1.0 + math.exp(-score_raw))
     p = p_long if side == "LONG" else (1.0 - p_long)
-    bonus = clip((p - 0.5) * 20.0, 0.0, 10.0)  # 0..10
+    bonus = clip((p - 0.5) * 20.0, 0.0, 10.0)
     return bonus, p, f"DL aktif (p={p:.3f}, bonus={bonus:.2f})"
 
 
@@ -514,7 +535,7 @@ def evaluate_symbol(symbol: str, one: list[Candle], five: list[Candle], micro: M
     prev_high = max(h[-21:-1])
     prev_low = min(l[-21:-1])
     taker_ratio = one[-1].taker_buy_volume / one[-1].volume if one[-1].volume > 0 else 0.5
-    spread_ok = micro.spread_bps <= 6.0  # spot için biraz gevşek
+    spread_ok = micro.spread_bps <= 6.0
 
     quality = {
         "Spread": spread_ok,
@@ -658,8 +679,8 @@ with st.sidebar:
     live = st.toggle("Canlı yenileme", True)
 
     st.header("Analiz")
-    one_limit = st.slider("1m mum sayısı", 500, 10000, 10000, 500)
-    five_limit = st.slider("5m mum sayısı", 500, 10000, 5000, 500)
+    one_limit = st.slider("1m mum sayısı", 500, 10000, 3000, 500)
+    five_limit = st.slider("5m mum sayısı", 500, 10000, 2000, 500)
 
     st.header("AI")
     use_dl = st.toggle("Derin öğrenme skor katkısı", True)
@@ -704,7 +725,7 @@ def dashboard():
     targets = list(dict.fromkeys([symbol, *radar]))
     packets, errors = {}, {}
 
-    with ThreadPoolExecutor(max_workers=min(6, len(targets))) as ex:
+    with ThreadPoolExecutor(max_workers=min(4, len(targets))) as ex:
         fmap = {ex.submit(scan_one, s): s for s in targets}
         for f in as_completed(fmap):
             s = fmap[f]
