@@ -2,17 +2,8 @@
 """
 Enterprise Binance Multi-Strategy + Optional AI/DL Streamlit Panel (single-file)
 
-Çalıştırma:
+Run:
     streamlit run app.py
-
-Özellikler:
-- Binance Futures veri akışı + Spot fallback (HTTP 451 toleransı)
-- Çoklu algoritma (trend, mean reversion, breakout, microstructure, quality gates)
-- Ensemble scoring
-- Telegram uyarı
-- Opsiyonel Binance Futures korumalı emir (TESTNET/LIVE)
-- Opsiyonel DL katmanı (TensorFlow varsa MLP), yoksa graceful fallback
-- Dayanıklı hata yönetimi, loglama, cache, timeout
 """
 
 from __future__ import annotations
@@ -238,8 +229,8 @@ class Signal:
 # 4) REST LAYER
 # ==========================
 
-REST = "https://fapi.binance.com"
-SPOT_REST = "https://data-api.binance.vision"
+REST = os.getenv("BINANCE_FUTURES_REST", "https://fapi.binance.com")
+SPOT_REST = os.getenv("BINANCE_SPOT_REST", "https://data-api.binance.vision")
 
 
 def get_json(path: str, params: dict, timeout: float = 12.0, base: str = REST):
@@ -251,6 +242,25 @@ def get_json(path: str, params: dict, timeout: float = 12.0, base: str = REST):
 
 def _is_451(exc: Exception) -> bool:
     return isinstance(exc, HTTPError) and exc.code == 451
+
+
+def is_restricted_location_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return ("http 451" in msg) or ("restricted location" in msg) or ("eligibility" in msg)
+
+
+def futures_probe(base_url: str) -> tuple[bool, str]:
+    """Unsigned probe: endpoint accessibility test."""
+    try:
+        req = Request(f"{base_url}/fapi/v1/time", headers={"User-Agent": "probe/1.0"})
+        with urlopen(req, timeout=8) as r:
+            if r.status >= 400:
+                return False, f"HTTP {r.status}"
+        return True, "OK"
+    except Exception as exc:
+        if is_restricted_location_error(exc):
+            return False, "HTTP 451 restricted location"
+        return False, str(exc)
 
 
 def klines(symbol: str, interval: str, limit: int = 250) -> list[Candle]:
@@ -449,26 +459,18 @@ def evaluate_symbol(symbol: str, one: list[Candle], five: list[Candle], micro: M
         base_passed = sum(base.values())
         total_passed = sum(all_features.values())
 
-        # ---- strategy votes ----
         votes = {}
-
         if enabled.get("trend_follow", True):
             votes["trend_follow"] = 1.0 if ((side == "LONG" and ema20_5m > ema50_5m) or (side == "SHORT" and ema20_5m < ema50_5m)) else 0.0
-
         if enabled.get("breakout", True):
             votes["breakout"] = 1.0 if base["Breakout"] and base["Volume"] else 0.0
-
         if enabled.get("mean_reversion", True):
-            # Ters mantık: extreme zscore'da dönüş
             votes["mean_reversion"] = 1.0 if ((side == "LONG" and z < -1.2) or (side == "SHORT" and z > 1.2)) else 0.0
-
         if enabled.get("microstructure", True):
             votes["microstructure"] = (float(orderbook_ok) + float(taker_ok) + (1.0 if oi_ok else 0.5)) / 3.0
-
         if enabled.get("quality_gate", True):
             votes["quality_gate"] = quality_passed / 4.0
 
-        # weighted ensemble
         weights = {
             "trend_follow": 0.24,
             "breakout": 0.22,
@@ -478,7 +480,6 @@ def evaluate_symbol(symbol: str, one: list[Candle], five: list[Candle], micro: M
         }
         vote_score = sum(votes.get(k, 0.0) * weights[k] for k in weights)
 
-        # confidence
         confidence = round(
             base_passed * 5.0
             + quality_passed * 7.5
@@ -524,32 +525,19 @@ def evaluate_symbol(symbol: str, one: list[Candle], five: list[Candle], micro: M
 # ==========================
 
 def dl_predict_bonus(closes: list[float], side: str, enabled: bool) -> tuple[float, str]:
-    """
-    DL bonus puanı döndürür: [0..8] arası.
-    TensorFlow yoksa fallback.
-    """
     if not enabled:
         return 0.0, "DL pasif"
-
     try:
         import numpy as np  # type: ignore
-        from tensorflow import keras  # type: ignore
 
         if len(closes) < 80:
             return 0.0, "DL: yetersiz veri"
 
-        # Basit feature set (lightweight)
         rets = np.diff(np.array(closes[-61:], dtype=float)) / np.array(closes[-61:-1], dtype=float)
-        x = rets.reshape(1, -1)  # shape (1,60)
-
-        # Tiny MLP (inference-only random-init yerine deterministic score proxy)
-        # Not: burada gerçek eğitim yok; hızlı runtime için handcrafted output kullanıyoruz.
-        # Üretim sisteminde model registry’den yüklenmeli.
         momentum = float(np.mean(rets[-8:]))
         volatility = float(np.std(rets))
         raw = (momentum / (volatility + 1e-9)) * 0.6 + (np.sum(rets[-3:]) * 10.0) * 0.4
 
-        # side-aligned confidence
         if side == "LONG":
             prob = 1.0 / (1.0 + math.exp(-raw))
         else:
@@ -558,7 +546,7 @@ def dl_predict_bonus(closes: list[float], side: str, enabled: bool) -> tuple[flo
         bonus = max(0.0, min(8.0, (prob - 0.5) * 16.0))
         return float(bonus), f"DL aktif (bonus={bonus:.2f})"
     except Exception as exc:
-        return 0.0, f"DL fallback (TensorFlow yok/hata): {exc}"
+        return 0.0, f"DL fallback: {exc}"
 
 
 # ==========================
@@ -602,8 +590,8 @@ def format_signal(sig: Signal) -> str:
 # 8) TRADING (FUTURES)
 # ==========================
 
-LIVE_BASE = "https://fapi.binance.com"
-TESTNET_BASE = "https://demo-fapi.binance.com"
+LIVE_BASE = os.getenv("BINANCE_FUTURES_LIVE_REST", "https://fapi.binance.com")
+TESTNET_BASE = os.getenv("BINANCE_FUTURES_TESTNET_REST", "https://demo-fapi.binance.com")
 
 
 class BinanceAPIError(RuntimeError):
@@ -728,7 +716,6 @@ class FuturesClient:
         filled = Decimal(str(entry.get("executedQty", dec_text(qty))))
         avg = float(entry.get("avgPrice") or sig.entry)
 
-        # Basit stop / tp market
         stop_px = trigger_price(sig.stop, rules.tick_size, up=(sig.side == "SHORT"))
         tp_px = trigger_price(sig.tp1, rules.tick_size, up=(sig.side == "LONG"))
 
@@ -753,7 +740,7 @@ st.markdown(
     """
     <style>
     .stApp { background: radial-gradient(circle at 15% 0%, #13233d 0, #07111f 38%, #040914 100%); }
-    [data-testid="stSidebar"] { background: linear-gradient(180deg, #0c1728 0%, #07101d 100%); }
+    [data-testid="stSidebar"] { background: linear-gradient(180deg, #0c1728 0, #07101d 100%); }
     </style>
     """,
     unsafe_allow_html=True,
@@ -812,13 +799,27 @@ with st.sidebar:
     lev = st.slider("Kaldıraç", 1, 20, 2)
     max_slip = st.number_input("Max slippage bps", 0.1, 100.0, 5.0, 0.1)
 
+    probe_base = TESTNET_BASE if env == "TESTNET" else LIVE_BASE
+    probe_ok, probe_msg = futures_probe(probe_base)
+    if not probe_ok:
+        st.warning(f"Futures endpoint erişimi sorunlu: {probe_msg}")
+        if "451" in probe_msg:
+            st.error("Bu IP/ortam Binance Futures için eligible değil. Trade modu otomatik pasif.")
+            trading_enabled = False
+
     if st.button("API Test"):
         try:
             c = FuturesClient(key, sec, testnet=(env == "TESTNET"))
             bal = c.account_balance()
             st.success(f"USDT: {bal.get('USDT', 0):,.2f}")
         except Exception as e:
-            st.error(f"API test hata: {e}")
+            if is_restricted_location_error(e):
+                st.error(
+                    "Binance Futures HTTP 451: Bu IP/ortam eligible değil. "
+                    "API key doğru olsa bile futures erişimi reddedilir."
+                )
+            else:
+                st.error(f"API test hata: {e}")
 
 cfg = Settings(
     symbols=(symbol,),
@@ -843,8 +844,6 @@ if "sent" not in st.session_state:
     st.session_state.sent = set()
 if "scan_offset" not in st.session_state:
     st.session_state.scan_offset = 0
-if "radar_history" not in st.session_state:
-    st.session_state.radar_history = {}
 
 
 def scan_symbol(s: str):
@@ -921,7 +920,6 @@ def dashboard():
     chart = pd.DataFrame({"Fiyat": [c.close for c in one[-120:]]}, index=pd.to_datetime([c.open_time for c in one[-120:]], unit="ms"))
     st.line_chart(chart, height=260)
 
-    # Radar
     rows = []
     candidates: list[Signal] = []
     for s in radar:
@@ -1002,7 +1000,8 @@ def dashboard():
                 except Exception as e:
                     st.error(f"Telegram hata: {e}")
 
-            if st.button(f"{side} Market Emir Aç", key=f"order_{side}", disabled=not (trading_enabled and key and sec)):
+            order_disabled = not (trading_enabled and key and sec and probe_ok)
+            if st.button(f"{side} Market Emir Aç", key=f"order_{side}", disabled=order_disabled):
                 try:
                     if env == "LIVE":
                         st.warning("LIVE modunda gerçek para riski var.")
@@ -1011,7 +1010,10 @@ def dashboard():
                     msg = client.open_market_with_basic_sl_tp(sig, notional, lev, cfg.max_entry_slippage_bps)
                     st.success(f"Emir başarılı: {msg}")
                 except Exception as e:
-                    st.error(f"Emir hata: {e}")
+                    if is_restricted_location_error(e):
+                        st.error("Emir reddedildi: Binance Futures 451 restricted location.")
+                    else:
+                        st.error(f"Emir hata: {e}")
 
     if auto_send and eligible_signals and tg_token and tg_chat:
         best = max(eligible_signals, key=lambda x: x.confidence)
