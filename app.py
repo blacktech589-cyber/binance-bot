@@ -36,14 +36,15 @@ def load_dotenv(path: str = ".env") -> None:
 load_dotenv()
 
 FAPI = os.getenv("BINANCE_FUTURES_REST", "https://fapi.binance.com")
-SPOT = os.getenv("BINANCE_SPOT_REST", "https://data-api.binance.vision")
+SPOT = os.getenv("BINANCE_SPOT_REST", "https://api.binance.com")
+FORCE_SPOT = os.getenv("FORCE_SPOT", "1") == "1"
 
 
 # ---------------- HTTP ----------------
-def req_json(base: str, path: str, params: dict | None = None, timeout: float = 12.0):
+def req_json(base: str, path: str, params: dict | None = None, timeout: float = 15.0):
     q = urlencode(params or {})
     url = f"{base}{path}" + (f"?{q}" if q else "")
-    req = Request(url, headers={"User-Agent": "enterprise-signal-panel/1.0"})
+    req = Request(url, headers={"User-Agent": "enterprise-signal-panel/2.0"})
     with urlopen(req, timeout=timeout) as r:
         return json.load(r)
 
@@ -55,30 +56,42 @@ def is_451(exc: Exception) -> bool:
     return ("restricted location" in s) or ("eligibility" in s) or ("http 451" in s)
 
 
+def parse_http_error(e: HTTPError) -> str:
+    try:
+        body = e.read().decode("utf-8", errors="ignore")
+        j = json.loads(body) if body else {}
+        code = j.get("code")
+        msg = j.get("msg")
+        if code is not None or msg:
+            return f"HTTP {e.code} | Binance code={code} msg={msg}"
+    except Exception:
+        pass
+    return f"HTTP {e.code} {e.reason}"
+
+
 # ---------------- SIGNED TEST (optional) ----------------
 def signed_futures_probe(api_key: str, api_secret: str, base: str = FAPI) -> tuple[bool, str]:
-    """
-    Hesap bakiyesi çekmeden, minimum signed çağrı ile key+secret doğrulaması yapar.
-    """
     try:
-        # server time
         t = req_json(base, "/fapi/v1/time")
         server_time = int(t["serverTime"])
 
-        # signed ping endpoint: /fapi/v2/account (read only)
         params = {"timestamp": server_time, "recvWindow": 5000}
         query = urlencode(params)
         sig = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         url = f"{base}/fapi/v2/account?{query}&signature={sig}"
-        req = Request(url, headers={"X-MBX-APIKEY": api_key, "User-Agent": "enterprise-signal-panel/1.0"})
+        req = Request(url, headers={"X-MBX-APIKEY": api_key, "User-Agent": "enterprise-signal-panel/2.0"})
         with urlopen(req, timeout=10) as r:
             if r.status >= 400:
                 return False, f"HTTP {r.status}"
             json.load(r)
         return True, "Futures API signed erişim OK"
-    except Exception as e:
+    except HTTPError as e:
         if is_451(e):
             return False, "HTTP 451 restricted location / eligibility"
+        return False, parse_http_error(e)
+    except URLError as e:
+        return False, f"Ağ hatası: {e}"
+    except Exception as e:
         return False, f"Hata: {e}"
 
 
@@ -93,7 +106,20 @@ def ema(values: Sequence[float], period: int) -> list[float]:
     return out
 
 
-def rsi(values: Sequence[float], period: int = 7) -> list[float]:
+def sma(values: Sequence[float], period: int) -> list[float]:
+    out = []
+    s = 0.0
+    q = []
+    for v in values:
+        q.append(float(v))
+        s += float(v)
+        if len(q) > period:
+            s -= q.pop(0)
+        out.append(s / len(q))
+    return out
+
+
+def rsi(values: Sequence[float], period: int = 14) -> list[float]:
     if len(values) < 2:
         return [50.0] * len(values)
     gains, losses = [0.0], [0.0]
@@ -154,6 +180,10 @@ def vwap_last(highs, lows, closes, volumes, period=20) -> float:
     return (pv / vv) if vv > 0 else closes[-1]
 
 
+def pct_change(a: float, b: float) -> float:
+    return ((a / b) - 1.0) if b else 0.0
+
+
 # ---------------- Domain ----------------
 @dataclass(frozen=True)
 class Candle:
@@ -197,17 +227,52 @@ class Signal:
     votes: dict[str, float]
     spread_bps: float
     dl_bonus: float
+    dl_prob: float
+    features_count: int
+
+
+# ---------------- Klines pagination (up to 10k) ----------------
+def fetch_klines_paged(base: str, path: str, symbol: str, interval: str, total_limit: int = 10000) -> list[list]:
+    out = []
+    end_time = None
+    remaining = total_limit
+    step = 1500  # Binance max
+    while remaining > 0:
+        lim = min(step, remaining)
+        p = {"symbol": symbol, "interval": interval, "limit": lim}
+        if end_time is not None:
+            p["endTime"] = end_time
+        rows = req_json(base, path, p)
+        if not rows:
+            break
+        out = rows + out
+        first_open = int(rows[0][0])
+        end_time = first_open - 1
+        remaining -= len(rows)
+        if len(rows) < lim:
+            break
+    # dedupe by open time
+    uniq = {}
+    for r in out:
+        uniq[int(r[0])] = r
+    return [uniq[k] for k in sorted(uniq.keys())]
 
 
 # ---------------- Data fetch ----------------
-def fetch_klines(symbol: str, interval: str, limit: int = 250) -> list[Candle]:
-    p = {"symbol": symbol, "interval": interval, "limit": limit}
-    try:
-        rows = req_json(FAPI, "/fapi/v1/klines", p)
-    except HTTPError as e:
-        if not is_451(e):
-            raise
-        rows = req_json(SPOT, "/api/v3/klines", p)
+def fetch_klines(symbol: str, interval: str, limit: int = 10000) -> list[Candle]:
+    if FORCE_SPOT:
+        rows = fetch_klines_paged(SPOT, "/api/v3/klines", symbol, interval, total_limit=limit)
+    else:
+        try:
+            rows = fetch_klines_paged(FAPI, "/fapi/v1/klines", symbol, interval, total_limit=limit)
+        except HTTPError as e:
+            if not is_451(e):
+                raise
+            rows = fetch_klines_paged(SPOT, "/api/v3/klines", symbol, interval, total_limit=limit)
+
+    if len(rows) > 1:
+        rows = rows[:-1]  # last incomplete candle
+
     return [
         Candle(
             open_time=int(r[0]),
@@ -216,23 +281,28 @@ def fetch_klines(symbol: str, interval: str, limit: int = 250) -> list[Candle]:
             low=float(r[3]),
             close=float(r[4]),
             volume=float(r[5]),
-            taker_buy_volume=float(r[9]),
+            taker_buy_volume=float(r[9]) if len(r) > 9 else float(r[5]) * 0.5,
         )
-        for r in rows[:-1]
+        for r in rows
     ]
 
 
 def fetch_micro(symbol: str, prev_oi: float | None) -> tuple[Micro, float | None]:
-    try:
-        d = req_json(FAPI, "/fapi/v1/depth", {"symbol": symbol, "limit": 20})
-        t = req_json(FAPI, "/fapi/v1/ticker/bookTicker", {"symbol": symbol})
-        oi_now = float(req_json(FAPI, "/fapi/v1/openInterest", {"symbol": symbol})["openInterest"])
-    except HTTPError as e:
-        if not is_451(e):
-            raise
+    if FORCE_SPOT:
         d = req_json(SPOT, "/api/v3/depth", {"symbol": symbol, "limit": 20})
         t = req_json(SPOT, "/api/v3/ticker/bookTicker", {"symbol": symbol})
         oi_now = None
+    else:
+        try:
+            d = req_json(FAPI, "/fapi/v1/depth", {"symbol": symbol, "limit": 20})
+            t = req_json(FAPI, "/fapi/v1/ticker/bookTicker", {"symbol": symbol})
+            oi_now = float(req_json(FAPI, "/fapi/v1/openInterest", {"symbol": symbol})["openInterest"])
+        except HTTPError as e:
+            if not is_451(e):
+                raise
+            d = req_json(SPOT, "/api/v3/depth", {"symbol": symbol, "limit": 20})
+            t = req_json(SPOT, "/api/v3/ticker/bookTicker", {"symbol": symbol})
+            oi_now = None
 
     bid_qty = sum(float(x[1]) for x in d["bids"])
     ask_qty = sum(float(x[1]) for x in d["asks"])
@@ -244,20 +314,7 @@ def fetch_micro(symbol: str, prev_oi: float | None) -> tuple[Micro, float | None
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_symbols() -> tuple[list[str], str]:
-    try:
-        ex = req_json(FAPI, "/fapi/v1/exchangeInfo", {})
-        active = {
-            s["symbol"]
-            for s in ex.get("symbols", [])
-            if s.get("status") == "TRADING"
-            and s.get("contractType") == "PERPETUAL"
-            and s.get("quoteAsset") == "USDT"
-        }
-        tk = req_json(FAPI, "/fapi/v1/ticker/24hr", {})
-        source = "Futures"
-    except HTTPError as e:
-        if not is_451(e):
-            raise
+    if FORCE_SPOT:
         ex = req_json(SPOT, "/api/v3/exchangeInfo", {})
         active = {
             s["symbol"]
@@ -267,41 +324,172 @@ def load_symbols() -> tuple[list[str], str]:
             and s.get("isSpotTradingAllowed", True)
         }
         tk = req_json(SPOT, "/api/v3/ticker/24hr", {})
-        source = "Spot fallback (Futures 451)"
+        source = "Spot (forced)"
+    else:
+        try:
+            ex = req_json(FAPI, "/fapi/v1/exchangeInfo", {})
+            active = {
+                s["symbol"]
+                for s in ex.get("symbols", [])
+                if s.get("status") == "TRADING"
+                and s.get("contractType") == "PERPETUAL"
+                and s.get("quoteAsset") == "USDT"
+            }
+            tk = req_json(FAPI, "/fapi/v1/ticker/24hr", {})
+            source = "Futures"
+        except HTTPError as e:
+            if not is_451(e):
+                raise
+            ex = req_json(SPOT, "/api/v3/exchangeInfo", {})
+            active = {
+                s["symbol"]
+                for s in ex.get("symbols", [])
+                if s.get("status") == "TRADING"
+                and s.get("quoteAsset") == "USDT"
+                and s.get("isSpotTradingAllowed", True)
+            }
+            tk = req_json(SPOT, "/api/v3/ticker/24hr", {})
+            source = "Spot fallback (Futures 451)"
 
     vol = {x["symbol"]: float(x.get("quoteVolume", 0)) for x in tk if x.get("symbol") in active}
     ordered = sorted(active, key=lambda s: vol.get(s, 0.0), reverse=True)
     return ordered, source
 
 
-# ---------------- DL bonus (lightweight) ----------------
-def dl_bonus(closes: list[float], side: str, enabled: bool) -> tuple[float, str]:
+# ---------------- 50 Features ----------------
+def build_50_features(one: list[Candle], five: list[Candle], micro: Micro) -> dict[str, float]:
+    c = [x.close for x in one]
+    o = [x.open for x in one]
+    h = [x.high for x in one]
+    l = [x.low for x in one]
+    v = [x.volume for x in one]
+    tb = [x.taker_buy_volume for x in one]
+    c5 = [x.close for x in five]
+    h5 = [x.high for x in five]
+    l5 = [x.low for x in five]
+    v5 = [x.volume for x in five]
+
+    # base indicators
+    ema9 = ema(c, 9)
+    ema20 = ema(c, 20)
+    ema50 = ema(c, 50)
+    ema100 = ema(c, 100)
+    rsi7 = rsi(c, 7)
+    rsi14 = rsi(c, 14)
+    macdh = macd_hist(c)
+    atr14 = atr(h, l, c, 14)
+    z20 = zscore(c, 20)
+    vw20 = vwap_last(h, l, c, v, 20)
+    mean_v20 = sum(v[-20:]) / 20 if len(v) >= 20 else (sum(v) / max(1, len(v)))
+    mean_v50 = sum(v[-50:]) / 50 if len(v) >= 50 else (sum(v) / max(1, len(v)))
+
+    feats: dict[str, float] = {}
+
+    # 1-10 returns
+    horizons = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
+    for i, n in enumerate(horizons, start=1):
+        feats[f"ret_{n}"] = pct_change(c[-1], c[-1 - n]) if len(c) > n else 0.0
+
+    # 11-15 candle structure
+    last_range = (h[-1] - l[-1]) if h[-1] != l[-1] else 1e-9
+    feats["body_ratio"] = abs(c[-1] - o[-1]) / last_range
+    feats["upper_wick_ratio"] = (h[-1] - max(c[-1], o[-1])) / last_range
+    feats["lower_wick_ratio"] = (min(c[-1], o[-1]) - l[-1]) / last_range
+    feats["close_pos_in_range"] = (c[-1] - l[-1]) / last_range
+    feats["hl_spread_pct"] = pct_change(h[-1], l[-1])
+
+    # 16-22 MA distances/slopes
+    feats["dist_ema9"] = pct_change(c[-1], ema9[-1])
+    feats["dist_ema20"] = pct_change(c[-1], ema20[-1])
+    feats["dist_ema50"] = pct_change(c[-1], ema50[-1])
+    feats["dist_ema100"] = pct_change(c[-1], ema100[-1])
+    feats["slope_ema20_5"] = pct_change(ema20[-1], ema20[-6]) if len(ema20) > 6 else 0.0
+    feats["slope_ema50_5"] = pct_change(ema50[-1], ema50[-6]) if len(ema50) > 6 else 0.0
+    feats["ema20_over_50"] = pct_change(ema20[-1], ema50[-1])
+
+    # 23-28 oscillators
+    feats["rsi7"] = rsi7[-1] / 100.0
+    feats["rsi14"] = rsi14[-1] / 100.0
+    feats["rsi_delta"] = (rsi14[-1] - rsi14[-4]) / 100.0 if len(rsi14) > 4 else 0.0
+    feats["macdh"] = macdh[-1]
+    feats["macdh_delta"] = (macdh[-1] - macdh[-2]) if len(macdh) > 1 else 0.0
+    feats["z20"] = z20
+
+    # 29-34 volatility/range
+    feats["atr14_pct"] = atr14 / c[-1] if c[-1] else 0.0
+    feats["range20_pct"] = pct_change(max(h[-20:]), min(l[-20:])) if len(h) >= 20 else 0.0
+    feats["std20_ret"] = float(pd.Series(c).pct_change().tail(20).std() or 0.0)
+    feats["std50_ret"] = float(pd.Series(c).pct_change().tail(50).std() or 0.0)
+    feats["bb_width_proxy"] = (2 * (float(pd.Series(c).tail(20).std() or 0.0))) / (float(pd.Series(c).tail(20).mean() or 1e-9))
+    feats["atr_ratio_5_20"] = (
+        (sum([abs(c[-i] - c[-i - 1]) for i in range(1, 6)]) / 5) /
+        (sum([abs(c[-i] - c[-i - 1]) for i in range(1, 21)]) / 20 + 1e-9)
+        if len(c) > 21 else 1.0
+    )
+
+    # 35-40 volume/taker
+    feats["vol_ratio_20"] = v[-1] / (mean_v20 + 1e-9)
+    feats["vol_ratio_50"] = v[-1] / (mean_v50 + 1e-9)
+    feats["vol_trend_5"] = (sum(v[-5:]) / 5) / ((sum(v[-20:]) / 20) + 1e-9) if len(v) >= 20 else 1.0
+    feats["taker_ratio"] = (tb[-1] / v[-1]) if v[-1] > 0 else 0.5
+    feats["taker_trend_5"] = (
+        (sum([(tb[-i] / v[-i]) if v[-i] > 0 else 0.5 for i in range(1, 6)]) / 5)
+        if len(v) >= 6 else 0.5
+    )
+    feats["vwap_dev_bps"] = ((c[-1] / vw20) - 1.0) * 10000.0 if vw20 > 0 else 0.0
+
+    # 41-45 microstructure
+    feats["spread_bps"] = micro.spread_bps
+    feats["imbalance"] = micro.imbalance
+    feats["oi_change_pct"] = micro.oi_change_pct if micro.oi_change_pct is not None else 0.0
+    feats["mid_move_1"] = pct_change((micro.bid + micro.ask) / 2.0, c[-2]) if len(c) > 2 else 0.0
+    feats["book_pressure"] = micro.imbalance / (micro.spread_bps + 1e-9)
+
+    # 46-50 multi-timeframe coherence
+    ema20_5 = ema(c5, 20)
+    ema50_5 = ema(c5, 50)
+    rsi5 = rsi(c5, 14)
+    feats["mtf_trend"] = pct_change(ema20_5[-1], ema50_5[-1]) if len(ema50_5) > 0 else 0.0
+    feats["mtf_rsi"] = rsi5[-1] / 100.0
+    feats["mtf_ret_5"] = pct_change(c5[-1], c5[-6]) if len(c5) > 6 else 0.0
+    feats["mtf_range_20"] = pct_change(max(h5[-20:]), min(l5[-20:])) if len(h5) >= 20 else 0.0
+    feats["mtf_vol_ratio"] = (v5[-1] / ((sum(v5[-20:]) / 20) + 1e-9)) if len(v5) >= 20 else 1.0
+
+    return feats
+
+
+# ---------------- DL bonus from 50 features ----------------
+def dl_bonus_from_features(features: dict[str, float], side: str, enabled: bool) -> tuple[float, float, str]:
     if not enabled:
-        return 0.0, "DL kapalı"
-    if len(closes) < 80:
-        return 0.0, "DL veri yetersiz"
+        return 0.0, 0.5, "DL kapalı"
 
-    # lightweight probabilistic proxy (no heavy dependency)
-    rets = []
-    for i in range(-60, -1):
-        prev = closes[i]
-        cur = closes[i + 1]
-        rets.append((cur - prev) / prev if prev else 0.0)
+    # feature normalization helpers
+    def clip(x, lo, hi):
+        return max(lo, min(hi, x))
 
-    mu = sum(rets[-8:]) / max(1, len(rets[-8:]))
-    var = sum((x - (sum(rets) / len(rets))) ** 2 for x in rets) / len(rets)
-    sigma = math.sqrt(var) if var > 0 else 1e-9
-    raw = (mu / sigma) * 0.6 + (sum(rets[-3:]) * 10.0) * 0.4
+    # pseudo-model (lightweight logistic score from 50 features)
+    x = features
+    score_raw = 0.0
+    score_raw += clip(x["ret_3"] * 120, -3, 3) * 0.10
+    score_raw += clip(x["ret_8"] * 80, -3, 3) * 0.08
+    score_raw += clip(x["dist_ema20"] * 200, -3, 3) * 0.10
+    score_raw += clip((x["rsi14"] - 0.5) * 6, -3, 3) * 0.08
+    score_raw += clip(x["macdh"] * 400, -3, 3) * 0.08
+    score_raw += clip(x["macdh_delta"] * 500, -3, 3) * 0.07
+    score_raw += clip(x["vol_ratio_20"] - 1.0, -2, 3) * 0.10
+    score_raw += clip(x["taker_ratio"] - 0.5, -1, 1) * 0.20
+    score_raw += clip(x["imbalance"] * 5, -3, 3) * 0.12
+    score_raw += clip(x["mtf_trend"] * 150, -3, 3) * 0.07
 
-    p_long = 1.0 / (1.0 + math.exp(-raw))
+    p_long = 1.0 / (1.0 + math.exp(-score_raw))
     p = p_long if side == "LONG" else (1.0 - p_long)
-    bonus = max(0.0, min(8.0, (p - 0.5) * 16.0))
-    return bonus, f"DL aktif (bonus={bonus:.2f})"
+    bonus = clip((p - 0.5) * 20.0, 0.0, 10.0)  # 0..10
+    return bonus, p, f"DL aktif (p={p:.3f}, bonus={bonus:.2f})"
 
 
 # ---------------- Signal engine ----------------
 def evaluate_symbol(symbol: str, one: list[Candle], five: list[Candle], micro: Micro, use_dl: bool) -> dict[str, Signal]:
-    if len(one) < 70 or len(five) < 70:
+    if len(one) < 120 or len(five) < 120:
         return {}
 
     c = [x.close for x in one]
@@ -326,15 +514,17 @@ def evaluate_symbol(symbol: str, one: list[Candle], five: list[Candle], micro: M
     prev_high = max(h[-21:-1])
     prev_low = min(l[-21:-1])
     taker_ratio = one[-1].taker_buy_volume / one[-1].volume if one[-1].volume > 0 else 0.5
-    spread_ok = micro.spread_bps <= 2.5
+    spread_ok = micro.spread_bps <= 6.0  # spot için biraz gevşek
 
     quality = {
         "Spread": spread_ok,
-        "VWAPDev": abs(vwap_dev) <= 40.0,
-        "ZScore": abs(z) <= 2.8,
-        "ATRRegime": 1.0 <= atr_bps <= 90.0,
+        "VWAPDev": abs(vwap_dev) <= 60.0,
+        "ZScore": abs(z) <= 3.2,
+        "ATRRegime": 1.0 <= atr_bps <= 120.0,
     }
     q_pass = sum(quality.values())
+
+    features = build_50_features(one, five, micro)
 
     out: dict[str, Signal] = {}
     for side in ("LONG", "SHORT"):
@@ -342,28 +532,28 @@ def evaluate_symbol(symbol: str, one: list[Candle], five: list[Candle], micro: M
             checks = {
                 "Trend": e20_5 > e50_5,
                 "EMA20": entry > e20,
-                "RSI": 50 <= r <= 72,
+                "RSI": 48 <= r <= 75,
                 "MACD": mh[-1] > 0 and mh[-1] > mh[-2],
-                "Volume": v[-1] > mean_vol * 1.25,
+                "Volume": v[-1] > mean_vol * 1.20,
                 "Breakout": entry > prev_high,
-                "Orderbook": micro.imbalance >= 0.05,
-                "Taker": taker_ratio >= 0.53,
+                "Orderbook": micro.imbalance >= 0.03,
+                "Taker": taker_ratio >= 0.52,
             }
             early = checks["Trend"] and checks["MACD"] and checks["Volume"] and (c[-1] > c[-2] > c[-3])
-            sl, tp1, tp2 = entry - 0.8 * a, entry + 0.8 * a, entry + 1.2 * a
+            sl, tp1, tp2 = entry - 0.9 * a, entry + 0.9 * a, entry + 1.4 * a
         else:
             checks = {
                 "Trend": e20_5 < e50_5,
                 "EMA20": entry < e20,
-                "RSI": 28 <= r <= 50,
+                "RSI": 25 <= r <= 52,
                 "MACD": mh[-1] < 0 and mh[-1] < mh[-2],
-                "Volume": v[-1] > mean_vol * 1.25,
+                "Volume": v[-1] > mean_vol * 1.20,
                 "Breakout": entry < prev_low,
-                "Orderbook": micro.imbalance <= -0.05,
-                "Taker": taker_ratio <= 0.47,
+                "Orderbook": micro.imbalance <= -0.03,
+                "Taker": taker_ratio <= 0.48,
             }
             early = checks["Trend"] and checks["MACD"] and checks["Volume"] and (c[-1] < c[-2] < c[-3])
-            sl, tp1, tp2 = entry + 0.8 * a, entry - 0.8 * a, entry - 1.2 * a
+            sl, tp1, tp2 = entry + 0.9 * a, entry - 0.9 * a, entry - 1.4 * a
 
         votes = {
             "trend": 1.0 if checks["Trend"] else 0.0,
@@ -373,14 +563,14 @@ def evaluate_symbol(symbol: str, one: list[Candle], five: list[Candle], micro: M
             "quality": q_pass / 4.0,
             "early": 1.0 if early else 0.0,
         }
-        w = {"trend": 0.22, "breakout": 0.20, "reversion": 0.12, "micro": 0.20, "quality": 0.16, "early": 0.10}
+        w = {"trend": 0.22, "breakout": 0.20, "reversion": 0.10, "micro": 0.18, "quality": 0.15, "early": 0.10}
         vote_score = sum(votes[k] * w[k] for k in w)
 
         base_passed = sum(checks.values())
         total_passed = base_passed + q_pass
 
-        bonus, _dl_state = dl_bonus(c, side, use_dl)
-        score = round(base_passed * 5 + q_pass * 7 + vote_score * 20 + bonus)
+        bonus, p, _dl_state = dl_bonus_from_features(features, side, use_dl)
+        score = round(base_passed * 5 + q_pass * 7 + vote_score * 22 + bonus * 2.2)
         score = max(0, min(score, 100))
 
         out[side] = Signal(
@@ -400,6 +590,8 @@ def evaluate_symbol(symbol: str, one: list[Candle], five: list[Candle], micro: M
             votes=votes,
             spread_bps=micro.spread_bps,
             dl_bonus=bonus,
+            dl_prob=p,
+            features_count=len(features),
         )
     return out
 
@@ -425,9 +617,9 @@ def signal_text(sig: Signal) -> str:
     return (
         f"<b>{header}</b>\n"
         f"<b>{sig.symbol} — {sig.side}</b>\n"
-        f"Skor: <b>{sig.score}/100</b> (DL bonus {sig.dl_bonus:.2f})\n"
+        f"Skor: <b>{sig.score}/100</b> (DL bonus {sig.dl_bonus:.2f}, p={sig.dl_prob:.3f})\n"
         f"Base: {sig.base_passed}/8 | Kalite: {sig.quality_passed}/4 | Toplam: {sig.total_passed}\n"
-        f"Spread: {sig.spread_bps:.2f} bps\n"
+        f"Spread: {sig.spread_bps:.2f} bps | Feature: {sig.features_count}\n"
         f"Entry: <code>{sig.entry:.6f}</code>\nTP1: <code>{sig.tp1:.6f}</code>\nTP2: <code>{sig.tp2:.6f}</code>\nSL: <code>{sig.sl:.6f}</code>\n\n"
         f"<pre>{checks}</pre>\n"
         f"<i>Yatırım tavsiyesi değildir.</i>"
@@ -437,14 +629,16 @@ def signal_text(sig: Signal) -> str:
 # ---------------- UI ----------------
 st.set_page_config(page_title="Enterprise Signal Radar", page_icon="📡", layout="wide")
 st.title("📡 Enterprise Signal Radar")
-st.caption("Sinyal sistemi: API key/secret testi + çoklu algoritma + DL + Telegram")
+st.caption("Sinyal sistemi: Spot/Futures + 50 feature + DL proxy + 10k mum analiz")
 
 with st.sidebar:
     st.header("API & Güvenlik")
     api_key = st.text_input("Binance API Key", os.getenv("BINANCE_API_KEY", ""), type="password")
     api_secret = st.text_input("Binance API Secret", os.getenv("BINANCE_API_SECRET", ""), type="password")
 
-    if st.button("Futures API Test (Signed)"):
+    st.info(f"Mode: {'SPOT (FORCED)' if FORCE_SPOT else 'FUTURES/Auto-fallback'}")
+
+    if st.button("Futures API Test (Signed)", disabled=FORCE_SPOT):
         if not api_key or not api_secret:
             st.error("API key ve secret gir.")
         else:
@@ -457,11 +651,15 @@ with st.sidebar:
     st.header("Tarama")
     symbols, source = load_symbols()
     st.caption(f"Veri kaynağı: {source}")
-    symbol = st.selectbox("Detay paritesi", symbols, index=0)
+    symbol = st.selectbox("Detay paritesi", symbols, index=0 if symbols else None)
     scan_all = st.toggle("Hareketli coin tara", True)
-    batch = st.slider("Tur başına coin", 5, 25, 12, 1)
-    refresh = st.slider("Yenileme (sn)", 5, 60, 15, 1)
+    batch = st.slider("Tur başına coin", 3, 15, 6, 1)
+    refresh = st.slider("Yenileme (sn)", 10, 120, 30, 5)
     live = st.toggle("Canlı yenileme", True)
+
+    st.header("Analiz")
+    one_limit = st.slider("1m mum sayısı", 500, 10000, 10000, 500)
+    five_limit = st.slider("5m mum sayısı", 500, 10000, 5000, 500)
 
     st.header("AI")
     use_dl = st.toggle("Derin öğrenme skor katkısı", True)
@@ -480,8 +678,8 @@ if "sent_keys" not in st.session_state:
 
 
 def scan_one(sym: str):
-    one = fetch_klines(sym, "1m")
-    five = fetch_klines(sym, "5m")
+    one = fetch_klines(sym, "1m", limit=one_limit)
+    five = fetch_klines(sym, "5m", limit=five_limit)
     micro, oi = fetch_micro(sym, st.session_state.oi.get(sym))
     sigs = evaluate_symbol(sym, one, five, micro, use_dl=use_dl)
     return one, five, micro, oi, sigs
@@ -492,7 +690,11 @@ run_every = refresh if live else None
 
 @st.fragment(run_every=run_every)
 def dashboard():
-    if scan_all and symbols:
+    if not symbols:
+        st.error("Sembol listesi boş.")
+        return
+
+    if scan_all:
         off = st.session_state.offset % len(symbols)
         radar = [symbols[(off + i) % len(symbols)] for i in range(min(batch, len(symbols)))]
     else:
@@ -502,7 +704,7 @@ def dashboard():
     targets = list(dict.fromkeys([symbol, *radar]))
     packets, errors = {}, {}
 
-    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as ex:
+    with ThreadPoolExecutor(max_workers=min(6, len(targets))) as ex:
         fmap = {ex.submit(scan_one, s): s for s in targets}
         for f in as_completed(fmap):
             s = fmap[f]
@@ -519,16 +721,17 @@ def dashboard():
     for s, p in packets.items():
         st.session_state.oi[s] = p[3]
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Son fiyat", f"{one[-1].close:,.4f}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Son fiyat", f"{one[-1].close:,.6f}")
     c2.metric("Spread", f"{micro.spread_bps:.2f} bps")
     c3.metric("Güncelleme", datetime.now().strftime("%H:%M:%S"))
+    c4.metric("1m mum", f"{len(one)}")
 
     df_price = pd.DataFrame(
-        {"Fiyat": [x.close for x in one[-140:]]},
-        index=pd.to_datetime([x.open_time for x in one[-140:]], unit="ms"),
+        {"Fiyat": [x.close for x in one[-500:]]},
+        index=pd.to_datetime([x.open_time for x in one[-500:]], unit="ms"),
     )
-    st.line_chart(df_price, height=260)
+    st.line_chart(df_price, height=280)
 
     rows = []
     eligible: list[Signal] = []
@@ -547,6 +750,8 @@ def dashboard():
                 "Parite": s,
                 "Yön": best.side,
                 "Skor": best.score,
+                "DL p": round(best.dl_prob, 3),
+                "Feature": best.features_count,
                 "EarlyUptrend": "EVET" if best.early_uptrend else "HAYIR",
                 "Base": best.base_passed,
                 "Kalite": best.quality_passed,
@@ -568,6 +773,7 @@ def dashboard():
             st.metric(f"{side} Skor", f"{sig.score}/100")
             st.write("Entry / TP / SL", {"entry": sig.entry, "tp1": sig.tp1, "tp2": sig.tp2, "sl": sig.sl})
             st.write("Algoritma Oyları", sig.votes)
+            st.write("DL", {"prob": sig.dl_prob, "bonus": sig.dl_bonus, "features": sig.features_count})
 
             if st.button(f"{side} Telegram Gönder", key=f"tg_{side}", disabled=not (tg_token and tg_chat)):
                 try:
