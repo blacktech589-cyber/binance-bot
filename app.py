@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Binance Spot USDT paritelerinde düşük fiyat + yükseliş başlangıcı tarayıcısı.
+"""Binance Spot oynak piyasa tarayıcısı ve Telegram sinyal servisi.
 
-Emir göndermez, API anahtarı istemez. Yatırım tavsiyesi değildir.
+- Emir göndermez.
+- 10.000 kapanmış mumu Binance'in 1000 mumluk sayfalarıyla indirir.
+- API/secret ve Telegram bilgilerini yalnızca ortam değişkenlerinden okur.
+- Sinyaller yatırım tavsiyesi değildir.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -14,48 +16,95 @@ import math
 import os
 import statistics
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
-
-BASE_URL = "https://data-api.binance.vision"
-TRADING_URL = "https://api.binance.com"
+MARKET_URL = "https://data-api.binance.vision"
+SIGNED_URL = "https://api.binance.com"
 STABLES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "EUR", "TRY", "AEUR"}
 LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 
 
-def api_get(path: str, params: dict | None = None, retries: int = 3):
-    url = BASE_URL + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
+def request_json(url: str, data: dict | None = None, headers: dict | None = None, retries: int = 4):
+    body = urllib.parse.urlencode(data).encode() if data is not None else None
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "coin-scanner/1.0"})
-            with urllib.request.urlopen(req, timeout=15) as response:
+            req = urllib.request.Request(url, data=body, headers=headers or {"User-Agent": "long-signal/1.0"})
+            with urllib.request.urlopen(req, timeout=25) as response:
                 return json.load(response)
-        except Exception:
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (418, 429, 500, 502, 503, 504) or attempt == retries - 1:
+                raise
+            delay = int(exc.headers.get("Retry-After", 2 ** attempt))
+            time.sleep(max(1, delay))
+        except (urllib.error.URLError, TimeoutError):
             if attempt == retries - 1:
                 raise
-            time.sleep(2**attempt)
+            time.sleep(2 ** attempt)
 
 
-def signed_get(path: str, params: dict | None = None):
-    """BINANCE_API_KEY / BINANCE_API_SECRET ile salt-okunur imzalı istek."""
-    api_key = os.environ.get("BINANCE_API_KEY")
-    secret = os.environ.get("BINANCE_API_SECRET")
-    if not api_key or not secret:
-        raise RuntimeError("BINANCE_API_KEY ve BINANCE_API_SECRET ortam değişkenleri eksik")
-    payload = dict(params or {})
-    payload.update({"timestamp": int(time.time() * 1000), "recvWindow": 5000})
-    query = urllib.parse.urlencode(payload)
+def market_get(path: str, params: dict | None = None):
+    url = MARKET_URL + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    return request_json(url)
+
+
+def signed_account():
+    """Salt-okunur hesap kontrolü; API anahtarının çalıştığını doğrular."""
+    key = os.getenv("BINANCE_API_KEY")
+    secret = os.getenv("BINANCE_API_SECRET")
+    if not key or not secret:
+        raise RuntimeError("BINANCE_API_KEY ve BINANCE_API_SECRET eksik")
+    params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000, "omitZeroBalances": "true"}
+    query = urllib.parse.urlencode(params)
     signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-    req = urllib.request.Request(
-        f"{TRADING_URL}{path}?{query}&signature={signature}",
-        headers={"X-MBX-APIKEY": api_key, "User-Agent": "coin-scanner/2.0"},
+    return request_json(
+        f"{SIGNED_URL}/api/v3/account?{query}&signature={signature}",
+        headers={"X-MBX-APIKEY": key, "User-Agent": "long-signal/1.0"},
     )
-    with urllib.request.urlopen(req, timeout=15) as response:
-        return json.load(response)
+
+
+@dataclass
+class Candle:
+    open_time: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+def fetch_closed_klines(symbol: str, interval: str, total: int = 10_000) -> list[Candle]:
+    """En yeni kapanmış mumdan geriye doğru sayfalar; oluşan son mumu atar."""
+    rows: list[list] = []
+    end_time = int(time.time() * 1000)
+    while len(rows) < total + 1:
+        limit = min(1000, total + 1 - len(rows))
+        page = market_get("/api/v3/klines", {
+            "symbol": symbol, "interval": interval, "limit": limit, "endTime": end_time
+        })
+        if not page:
+            break
+        rows = page + rows
+        end_time = int(page[0][0]) - 1
+        if len(page) < limit:
+            break
+        time.sleep(0.12)
+    candles = [Candle(int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])) for x in rows]
+    if candles and candles[-1].open_time + interval_ms(interval) > int(time.time() * 1000):
+        candles.pop()
+    return candles[-total:]
+
+
+def interval_ms(interval: str) -> int:
+    unit = interval[-1]
+    value = int(interval[:-1])
+    return value * {"m": 60_000, "h": 3_600_000, "d": 86_400_000}[unit]
 
 
 def ema(values: list[float], period: int) -> list[float]:
@@ -66,192 +115,227 @@ def ema(values: list[float], period: int) -> list[float]:
     return out
 
 
-def rsi(values: list[float], period: int = 14) -> float:
-    changes = [b - a for a, b in zip(values, values[1:])]
-    gains = [max(x, 0.0) for x in changes[-period:]]
-    losses = [max(-x, 0.0) for x in changes[-period:]]
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    if avg_loss == 0:
-        return 100.0
-    return 100 - 100 / (1 + avg_gain / avg_loss)
+def rsi_series(values: list[float], period: int = 14) -> list[float]:
+    out = [50.0] * len(values)
+    for i in range(period, len(values)):
+        changes = [values[k] - values[k - 1] for k in range(i - period + 1, i + 1)]
+        gain = sum(max(x, 0) for x in changes) / period
+        loss = sum(max(-x, 0) for x in changes) / period
+        out[i] = 100.0 if loss == 0 else 100 - 100 / (1 + gain / loss)
+    return out
 
 
-def atr(highs: list[float], lows: list[float], closes: list[float], period: int = 14) -> float:
+def atr(candles: list[Candle], period: int = 14) -> float:
     tr = []
-    for i in range(1, len(closes)):
-        tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
-    return sum(tr[-period:]) / period
+    for i in range(1, len(candles)):
+        x, prev = candles[i], candles[i - 1]
+        tr.append(max(x.high - x.low, abs(x.high - prev.close), abs(x.low - prev.close)))
+    return statistics.fmean(tr[-period:])
 
 
-def macd_histogram(values: list[float]) -> tuple[float, float]:
-    line = [a - b for a, b in zip(ema(values, 12), ema(values, 26))]
-    signal = ema(line, 9)
-    return line[-1] - signal[-1], line[-2] - signal[-2]
+def adx(candles: list[Candle], period: int = 14) -> float:
+    tr = plus = minus = 0.0
+    for i in range(len(candles) - period, len(candles)):
+        x, prev = candles[i], candles[i - 1]
+        up, down = x.high - prev.high, prev.low - x.low
+        tr += max(x.high - x.low, abs(x.high - prev.close), abs(x.low - prev.close))
+        plus += max(up, 0) if up > down else 0
+        minus += max(down, 0) if down > up else 0
+    plus_di, minus_di = 100 * plus / tr, 100 * minus / tr
+    return 100 * abs(plus_di - minus_di) / (plus_di + minus_di or 1)
 
 
-def order_book_metrics(symbol: str) -> tuple[float, float]:
-    book = api_get("/api/v3/depth", {"symbol": symbol, "limit": 20})
-    bids = [(float(p), float(q)) for p, q in book["bids"]]
-    asks = [(float(p), float(q)) for p, q in book["asks"]]
-    bid_value = sum(p * q for p, q in bids)
-    ask_value = sum(p * q for p, q in asks)
-    imbalance = bid_value / (bid_value + ask_value) if bid_value + ask_value else 0.5
-    mid = (bids[0][0] + asks[0][0]) / 2
-    spread_bps = (asks[0][0] - bids[0][0]) / mid * 10_000
-    return imbalance, spread_bps
-
-
-@dataclass
-class Candidate:
-    symbol: str
-    price: float
-    quote_volume: float
-    change_24h: float
-
-
-def liquid_low_price_coins(max_price: float, min_volume: float, scan_limit: int) -> list[Candidate]:
-    """Algoritma 1: İşleme açık, likit, düşük nominal fiyatlı USDT pariteleri."""
-    info = api_get("/api/v3/exchangeInfo")
-    tickers = {x["symbol"]: x for x in api_get("/api/v3/ticker/24hr")}
-    symbols = []
+def select_volatile_symbols(min_volume: float, min_range_pct: float, limit: int) -> list[dict]:
+    info = market_get("/api/v3/exchangeInfo")
+    tickers = {x["symbol"]: x for x in market_get("/api/v3/ticker/24hr")}
+    allowed = set()
     for item in info["symbols"]:
         base = item["baseAsset"]
-        if (
-            item["status"] != "TRADING"
-            or item["quoteAsset"] != "USDT"
-            or not item.get("isSpotTradingAllowed", False)
-            or base in STABLES
-            or base.endswith(LEVERAGED_SUFFIXES)
-        ):
+        if (item["status"] == "TRADING" and item["quoteAsset"] == "USDT"
+                and item.get("isSpotTradingAllowed", False) and base not in STABLES
+                and not base.endswith(LEVERAGED_SUFFIXES)):
+            allowed.add(item["symbol"])
+    out = []
+    for symbol in allowed:
+        t = tickers.get(symbol)
+        if not t:
             continue
-        ticker = tickers.get(item["symbol"])
-        if not ticker:
-            continue
-        price = float(ticker["lastPrice"])
-        volume = float(ticker["quoteVolume"])
-        if 0 < price <= max_price and volume >= min_volume:
-            symbols.append(Candidate(item["symbol"], price, volume, float(ticker["priceChangePercent"])))
-    # API yükünü sınırlarken likiditesi en yüksek adayları önce inceler.
-    return sorted(symbols, key=lambda x: x.quote_volume, reverse=True)[:scan_limit]
+        volume = float(t["quoteVolume"])
+        low, high = float(t["lowPrice"]), float(t["highPrice"])
+        range_pct = (high - low) / low * 100 if low else 0
+        if volume >= min_volume and range_pct >= min_range_pct:
+            out.append({"symbol": symbol, "volume": volume, "range_pct": range_pct})
+    return sorted(out, key=lambda x: (x["range_pct"], math.log10(x["volume"])), reverse=True)[:limit]
 
 
-def rising_score(candidate: Candidate, interval: str) -> dict | None:
-    """Scalping topluluğu: bağımsız stratejilerin uzlaşısını puanlar."""
-    rows = api_get("/api/v3/klines", {"symbol": candidate.symbol, "interval": interval, "limit": 100})
-    # Son mum hâlâ oluşuyor olabilir; yanlış sinyali azaltmak için onu dışarıda bırak.
-    rows = rows[:-1]
-    highs = [float(x[2]) for x in rows]
-    lows = [float(x[3]) for x in rows]
-    closes = [float(x[4]) for x in rows]
-    volumes = [float(x[5]) for x in rows]
-    e9, e21 = ema(closes, 9), ema(closes, 21)
-    rsi14 = rsi(closes)
-    baseline_volume = sum(volumes[-21:-1]) / 20
-    volume_ratio = volumes[-1] / baseline_volume if baseline_volume else 0
-    recent_cross = any(e9[i - 1] <= e21[i - 1] and e9[i] > e21[i] for i in range(len(e9) - 3, len(e9)))
-    trend = e9[-1] > e21[-1] and e9[-1] > e9[-2]
-    breakout = closes[-1] > max(closes[-11:-1])
-    not_overheated = 48 <= rsi14 <= 68 and -5 <= candidate.change_24h <= 15
-
-    typical = [(h + l + c) / 3 for h, l, c in zip(highs[-20:], lows[-20:], closes[-20:])]
-    vwap20 = sum(p * v for p, v in zip(typical, volumes[-20:])) / sum(volumes[-20:])
+def analyze(symbol: str, candles: list[Candle], daily_range: float) -> dict | None:
+    if len(candles) < 500:
+        return None
+    closes = [x.close for x in candles]
+    volumes = [x.volume for x in candles]
+    e20, e50, e200 = ema(closes, 20), ema(closes, 50), ema(closes, 200)
+    e12, e26 = ema(closes, 12), ema(closes, 26)
+    macd_line = [a - b for a, b in zip(e12, e26)]
+    macd_signal = ema(macd_line, 9)
+    hist = macd_line[-1] - macd_signal[-1]
+    previous_hist = macd_line[-2] - macd_signal[-2]
+    rsi = rsi_series(closes)
+    rsi14 = rsi[-1]
+    stoch_window = rsi[-14:]
+    stoch_rsi = (rsi14 - min(stoch_window)) / (max(stoch_window) - min(stoch_window) or 1) * 100
     mean20 = statistics.fmean(closes[-20:])
     sd20 = statistics.pstdev(closes[-20:])
-    lower_band, upper_band = mean20 - 2 * sd20, mean20 + 2 * sd20
-    macd_now, macd_prev = macd_histogram(closes)
-    book_imbalance, spread_bps = order_book_metrics(candidate.symbol)
+    lower, upper = mean20 - 2 * sd20, mean20 + 2 * sd20
+    band_position = (closes[-1] - lower) / (upper - lower or 1)
+    band_width = (upper - lower) / mean20 * 100
+    current_atr = atr(candles)
+    atr_pct = current_atr / closes[-1] * 100
+    current_adx = adx(candles)
+    volume_ratio = volumes[-1] / statistics.fmean(volumes[-21:-1])
+    breakout_55 = closes[-1] > max(closes[-56:-1])
+    trend = closes[-1] > e20[-1] > e50[-1] > e200[-1]
+    long_trend = e50[-1] > e200[-1] and e200[-1] > e200[-5]
 
-    strategies = []
-    # 1) EMA trend/momentum
-    if trend and (recent_cross or macd_now > macd_prev > 0):
-        strategies.append("EMA_TREND")
-    # 2) Hacimli kısa dönem direnç kırılımı
-    if breakout and volume_ratio >= 1.5:
-        strategies.append("VOLUME_BREAKOUT")
-    # 3) VWAP üstüne geri dönüş
-    if closes[-2] <= vwap20 < closes[-1] and volume_ratio >= 1.15:
-        strategies.append("VWAP_RECLAIM")
-    # 4) Bollinger alt banttan ortalamaya dönüş (düşen bıçağı filtrele)
-    if lows[-2] <= lower_band and closes[-1] > closes[-2] and rsi14 >= 42 and e9[-1] >= e9[-2]:
-        strategies.append("BOLLINGER_REVERSAL")
-    # 5) Emir defteri alış baskısı; geniş spread varsa geçersiz
-    if book_imbalance >= 0.58 and spread_bps <= 12:
-        strategies.append("ORDERBOOK_PRESSURE")
-
-    score = min(100, len(strategies) * 16)
-    score += 8 if 50 <= rsi14 <= 64 else 0
-    score += 7 if volume_ratio >= 1.5 else 0
-    score += 5 if spread_bps <= 5 else 0
-    score = min(score, 100)
-    if not (not_overheated and spread_bps <= 12 and len(strategies) >= 2 and score >= 50):
+    votes = {
+        "EMA20>50>200": trend,
+        "EMA50/200 uzun trend": long_trend,
+        "MACD ivmesi": hist > 0 and hist > previous_hist,
+        "RSI sağlıklı": 50 <= rsi14 <= 68,
+        "Stoch RSI": 20 <= stoch_rsi <= 85,
+        "Bollinger konumu": 0.45 <= band_position <= 0.90,
+        "ADX trend gücü": current_adx >= 20,
+        "Hacim artışı": volume_ratio >= 1.30,
+        "55 mum kırılımı": breakout_55,
+        "ATR oynaklığı": atr_pct >= 1.0,
+    }
+    weights = [14, 12, 12, 8, 5, 8, 10, 12, 12, 7]
+    score = sum(w for w, ok in zip(weights, votes.values()) if ok)
+    # Aşırı ısınmış hareketleri cezalandır.
+    if rsi14 > 72 or band_position > 1.15:
+        score -= 20
+    if score < 72 or not trend or not long_trend:
         return None
 
-    current_atr = atr(highs, lows, closes)
-    stop = closes[-1] - 1.5 * current_atr
-    risk_per_coin = closes[-1] - stop
+    entry = closes[-1]
+    stop = entry - 2 * current_atr
+    risk = entry - stop
+    target1, target2 = entry + 2 * risk, entry + 3.5 * risk
     return {
-        "symbol": candidate.symbol,
-        "score": score,
-        "price": closes[-1],
-        "change_24h_pct": candidate.change_24h,
-        "quote_volume_usdt": candidate.quote_volume,
-        "rsi14": rsi14,
-        "volume_ratio": volume_ratio,
-        "recent_ema_cross": recent_cross,
-        "breakout_10": breakout,
-        "strategies": strategies,
-        "vwap20": vwap20,
-        "macd_hist": macd_now,
-        "orderbook_bid_ratio": book_imbalance,
-        "spread_bps": spread_bps,
-        "stop": stop,
-        "target_2r": closes[-1] + 2 * risk_per_coin,
-        "risk_per_coin": risk_per_coin,
+        "symbol": symbol, "score": max(0, min(100, score)), "entry": entry,
+        "stop": stop, "target1": target1, "target2": target2,
+        "rsi": rsi14, "stoch_rsi": stoch_rsi, "adx": current_adx,
+        "atr_pct": atr_pct, "band_position": band_position * 100,
+        "band_width": band_width, "volume_ratio": volume_ratio,
+        "daily_range": daily_range, "votes": votes, "candle_count": len(candles),
+        "candle_time": candles[-1].open_time,
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Binance Spot yükseliş başlangıcı tarayıcısı")
-    parser.add_argument("--max-price", type=float, default=1.0, help="Azami coin fiyatı (USDT)")
-    parser.add_argument("--min-volume", type=float, default=5_000_000, help="Asgari 24s hacim (USDT)")
-    parser.add_argument("--interval", default="15m", choices=["5m", "15m", "30m", "1h", "4h"])
-    parser.add_argument("--scan-limit", type=int, default=40, help="Kline istenecek azami parite")
-    parser.add_argument("--capital", type=float, default=1000.0, help="Örnek toplam sermaye (USDT)")
-    parser.add_argument("--risk-pct", type=float, default=0.5, help="İşlem başına risk yüzdesi")
-    parser.add_argument("--account", action="store_true", help="API anahtarıyla salt-okunur bakiye özeti")
-    args = parser.parse_args()
+def telegram_send(message: str):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN ve TELEGRAM_CHAT_ID eksik")
+    result = request_json(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data={"chat_id": chat_id, "text": message, "disable_web_page_preview": "true"},
+    )
+    if not result.get("ok"):
+        raise RuntimeError("Telegram mesajı kabul edilmedi: " + str(result.get("description")))
 
-    if args.account:
-        account = signed_get("/api/v3/account", {"omitZeroBalances": "true"})
-        balances = [f"{x['asset']}={float(x['free']):.8g}" for x in account.get("balances", []) if float(x["free"]) > 0]
-        print("Serbest bakiyeler:", ", ".join(balances) or "yok")
 
-    candidates = liquid_low_price_coins(args.max_price, args.min_volume, args.scan_limit)
-    results = []
-    for coin in candidates:
+def format_signal(s: dict, interval: str) -> str:
+    active = ", ".join(k for k, v in s["votes"].items() if v)
+    return (
+        f"🟢 UZUN VADE ARAŞTIRMA SİNYALİ\n\n"
+        f"Parite: {s['symbol']} | Zaman: {interval}\n"
+        f"Uzlaşı skoru: {s['score']}/100\n"
+        f"Kapanış: {s['entry']:.10g}\n"
+        f"Örnek stop: {s['stop']:.10g}\n"
+        f"Örnek hedef 1: {s['target1']:.10g}\n"
+        f"Örnek hedef 2: {s['target2']:.10g}\n\n"
+        f"RSI: {s['rsi']:.1f} | ADX: {s['adx']:.1f}\n"
+        f"ATR: %{s['atr_pct']:.2f} | Hacim: {s['volume_ratio']:.2f}x\n"
+        f"Bollinger konumu: %{s['band_position']:.0f} | Bant: %{s['band_width']:.2f}\n"
+        f"24s aralık: %{s['daily_range']:.1f} | Mum: {s['candle_count']}\n\n"
+        f"Olumlu kurallar: {active}\n\n"
+        "⚠️ Otomatik al emri değildir. Geçmiş performans geleceği garanti etmez."
+    )
+
+
+def load_state(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(path: Path, state: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def scan_once(args) -> list[dict]:
+    print(f"[{datetime.now(timezone.utc).isoformat()}] Oynak pariteler seçiliyor...")
+    markets = select_volatile_symbols(args.min_volume, args.min_range, args.market_limit)
+    state_path = Path(args.state_file)
+    state = load_state(state_path)
+    now = time.time()
+    signals = []
+    for index, market in enumerate(markets, 1):
+        symbol = market["symbol"]
+        print(f"[{index}/{len(markets)}] {symbol}: {args.candles} mum indiriliyor...")
         try:
-            signal = rising_score(coin, args.interval)
-            if signal:
-                risk_budget = args.capital * args.risk_pct / 100
-                units = risk_budget / signal["risk_per_coin"] if signal["risk_per_coin"] > 0 else 0
-                # Tek pozisyonun tüm sermayeyi aşmasını engelle.
-                units = min(units, args.capital / signal["price"])
-                signal["sample_position_units"] = units
-                signal["sample_position_usdt"] = units * signal["price"]
-                results.append(signal)
+            candles = fetch_closed_klines(symbol, args.interval, args.candles)
+            signal = analyze(symbol, candles, market["range_pct"])
+            if not signal:
+                continue
+            signals.append(signal)
+            last_sent = float(state.get(symbol, 0))
+            if now - last_sent >= args.cooldown_hours * 3600:
+                telegram_send(format_signal(signal, args.interval))
+                state[symbol] = now
+                save_state(state_path, state)
+                print(f"Telegram sinyali gönderildi: {symbol}")
+            else:
+                print(f"Tekrar sinyali engellendi: {symbol}")
         except Exception as exc:
-            print(f"Uyarı: {coin.symbol} atlandı: {exc}")
+            print(f"Uyarı - {symbol} atlandı: {exc}")
+        time.sleep(args.symbol_delay)
+    return sorted(signals, key=lambda x: x["score"], reverse=True)
 
-    results.sort(key=lambda x: (x["score"], x["quote_volume_usdt"]), reverse=True)
-    if not results:
-        print("Şu anda kurallara uyan sinyal yok. Filtreleri gevşetmek yerine beklemek de bir sonuçtur.")
-        return
-    print(f"{'PARİTE':12} {'PUAN':>5} {'FİYAT':>12} {'RSI':>6} {'HACİM×':>8} {'SPREAD':>7} {'STOP':>12} {'HEDEF':>12} STRATEJİLER")
-    for x in results[:15]:
-        print(f"{x['symbol']:12} {x['score']:5.0f} {x['price']:12.8g} {x['rsi14']:6.1f} "
-              f"{x['volume_ratio']:8.2f} {x['spread_bps']:7.2f} {x['stop']:12.8g} {x['target_2r']:12.8g} "
-              f"{','.join(x['strategies'])}")
+
+def main():
+    p = argparse.ArgumentParser(description="Binance 10.000 mum + Telegram uzun vade tarayıcı")
+    p.add_argument("--interval", choices=["15m", "30m", "1h", "4h", "1d"], default="1h")
+    p.add_argument("--candles", type=int, default=10_000)
+    p.add_argument("--market-limit", type=int, default=12, help="Taranacak en oynak parite sayısı")
+    p.add_argument("--min-volume", type=float, default=20_000_000, help="Asgari 24s USDT hacmi")
+    p.add_argument("--min-range", type=float, default=5.0, help="Asgari 24s fiyat aralığı yüzdesi")
+    p.add_argument("--loop-minutes", type=int, default=0, help="0: bir kez; pozitif: sürekli çalış")
+    p.add_argument("--cooldown-hours", type=float, default=24.0)
+    p.add_argument("--symbol-delay", type=float, default=0.5)
+    p.add_argument("--state-file", default="signal_state.json")
+    p.add_argument("--account-check", action="store_true")
+    p.add_argument("--telegram-test", action="store_true")
+    args = p.parse_args()
+    args.candles = max(500, min(args.candles, 10_000))
+
+    if args.account_check:
+        account = signed_account()
+        print("Binance API doğrulandı. Hesap işlem izni:", account.get("canTrade"))
+    if args.telegram_test:
+        telegram_send("✅ Binance sinyal servisi Telegram bağlantı testi başarılı.")
+        print("Telegram test mesajı gönderildi.")
+        if args.loop_minutes == 0:
+            return
+
+    while True:
+        signals = scan_once(args)
+        print(f"Tarama tamamlandı. Güçlü sinyal sayısı: {len(signals)}")
+        if args.loop_minutes <= 0:
+            break
+        time.sleep(max(1, args.loop_minutes) * 60)
 
 
 if __name__ == "__main__":
