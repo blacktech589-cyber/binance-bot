@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
-//|                        SmartScalper Pro AI v2.0                  |
-//|                   Derin Öğrenme Tabanlı Ticaret Robotu           |
+//|                        SmartScalper Pro AI v3.0                  |
+//|                   İŞLEM AÇACAK - GÜVENILIR VERSİYON              |
 //|                      Copyright 2026, AI Trading                  |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026 AI Trading"
 #property link      "https://github.com/blacktech589-cyber"
-#property version   "2.0"
+#property version   "3.0"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -16,22 +16,22 @@ input group "🤖 DERİN ÖĞRENME AYARLARI"
 input int      InpHistoryBars      = 1000;      // Geçmiş analiz (1000 mum)
 input int      InpSequenceLength   = 60;        // LSTM hafıza derinliği
 input int      InpFeatureCount     = 25;        // Özellik sayısı
-input double   InpConfidence       = 0.72;      // Güven eşiği (daha akıllı)
-input double   InpMinSignalStrength= 2.0;       // Minimum sinyal gücü
+input double   InpConfidence       = 0.55;      // DÜŞÜK Güven eşiği (işlem açsın!)
+input double   InpMinSignalStrength= 1.0;       // 1+ gösterge yeterli
 
 input group "💰 RİSK YÖNETİMİ"
-input double   InpLotSize          = 0.01;      // Lot miktarı
+input double   InpLotSize          = 0.01;      // Lot miktarı (KÜÇÜK test)
 input double   InpRiskPercent      = 2.0;       // Hesap riskinin %
-input double   InpTakeProfitPct    = 1.8;       // Kâr hedefi %
-input double   InpStopLossPct      = 0.9;       // Zarar durdurma %
-input int      InpMaxSpread        = 40;        // Maksimum spread (puan)
-input int      InpMaxTrades        = 1;         // Maksimum pozisyon
+input double   InpTakeProfitPct    = 1.5;       // Kâr hedefi %
+input double   InpStopLossPct      = 0.7;       // Zarar durdurma %
+input int      InpMaxSpread        = 50;        // Maksimum spread (puan)
+input int      InpMaxTrades        = 2;         // Maksimum pozisyon (2'ye çıkardı)
 input ulong    InpMagicNumber      = 778899;    // Sihirli numara
 
 input group "📊 TİCARET SAATLERİ"
-input int      InpStartHour        = 8;         // Başlangıç saati
-input int      InpEndHour          = 22;        // Bitiş saati
-input bool     InpUseNewYorkSession= true;      // NY seansını kullan
+input bool     InpAlwaysTrade      = true;      // HER SAATİ TİCART YAPMA!
+input int      InpStartHour        = 0;         // Başlangıç (0 = açık)
+input int      InpEndHour          = 23;        // Bitiş (23 = açık)
 
 //========== GÖSTERGELER ==========
 int rsi_handle, atr_handle;
@@ -43,6 +43,8 @@ MqlRates candles[];
 double global_trend_bias = 0.0;
 double longterm_highest = 0.0;
 double longterm_lowest = 0.0;
+
+int last_trade_bar = -1;  // Aynı mumda iki kez işlem açmamak için
 
 struct TradeStats {
     int total_trades;
@@ -57,8 +59,10 @@ TradeStats stats = {0, 0, 0, 0.0};
 //+------------------------------------------------------------------+
 int OnInit()
 {
+    Print("🚀 SmartScalper Pro AI v3.0 BAŞLATILIYOR!");
+    
     trade.SetExpertMagicNumber(InpMagicNumber);
-    trade.SetDeviationInPoints(50);
+    trade.SetDeviationInPoints(100);
     trade.SetTypeFilling(ORDER_FILLING_IOC);
     
     // Tarihsel analiz
@@ -86,21 +90,6 @@ int OnInit()
         Print("✅ ", bars, " mum analiz ediliyor... Trend Skoru: ", DoubleToString(global_trend_bias, 3));
     }
     
-    // ONNX Derin Öğrenme Modeli
-    long onnx_handle = OnnxCreate("smart_model.onnx", ONNX_DEFAULT);
-    if(onnx_handle != INVALID_HANDLE)
-    {
-        Print("🧠 ONNX Model Yüklendi!");
-        long input_shape[] = {1, InpSequenceLength, InpFeatureCount};
-        long output_shape[] = {1, 2};
-        OnnxSetInputShape(onnx_handle, 0, input_shape);
-        OnnxSetOutputShape(onnx_handle, 0, output_shape);
-    }
-    else
-    {
-        Print("⚠️ ONNX Model Bulunamadı - Fallback Mode");
-    }
-    
     // Göstergeler
     rsi_handle   = iRSI(_Symbol, PERIOD_H1, 14, PRICE_CLOSE);
     atr_handle   = iATR(_Symbol, PERIOD_H1, 14);
@@ -109,12 +98,17 @@ int OnInit()
     ema_slow     = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
     macd_handle  = iMACD(_Symbol, PERIOD_H1, 12, 26, 9, PRICE_CLOSE);
     bb_handle    = iBands(_Symbol, PERIOD_H1, 20, 2, PRICE_CLOSE);
-    volume_handle= iVolumes(_Symbol, PERIOD_H1, VOLUME_TICK);
     
-    if(rsi_handle == INVALID_HANDLE || atr_handle == INVALID_HANDLE)
+    if(rsi_handle == INVALID_HANDLE || atr_handle == INVALID_HANDLE ||
+       ema_fast == INVALID_HANDLE || ema_mid == INVALID_HANDLE || ema_slow == INVALID_HANDLE)
+    {
+        Print("❌ Gösterge hataları!");
         return(INIT_FAILED);
+    }
     
     ArrayResize(candles, InpSequenceLength + 10);
+    
+    Print("✅ İNİT BAŞARILI - HAZIR");
     return(INIT_SUCCEEDED);
 }
 
@@ -130,9 +124,8 @@ void OnDeinit(const int reason)
     IndicatorRelease(ema_slow);
     IndicatorRelease(macd_handle);
     IndicatorRelease(bb_handle);
-    IndicatorRelease(volume_handle);
     
-    Print("📊 Ticaret İstatistikleri:");
+    Print("📊 TICARET İSTATİSTİKLERİ:");
     Print("   Toplam İşlem: ", stats.total_trades);
     Print("   Kazananlar: ", stats.wins);
     Print("   Kaybedenler: ", stats.losses);
@@ -147,82 +140,111 @@ void OnTick()
     double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     
-    // Pazar saati kontrolü
-    if(!IsTradeTime())
+    if(ask <= 0 || bid <= 0)
+    {
+        Print("⚠️ Fiyat hatası");
         return;
+    }
     
-    // 1️⃣ AÇIK POZİSYON KONTROLÜ (Kar/Zarar)
-    CheckOpenPositions(ask, bid);
+    // Ticaret saati kontrolü
+    if(!InpAlwaysTrade && !IsTradeTime())
+    {
+        return;
+    }
     
-    // 2️⃣ SPREAD KONTROLÜ (Maksimum 40 puan)
+    // Spread kontrolü
     long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
     if(spread > InpMaxSpread)
     {
-        Print("⚠️ Spread çok yüksek: ", spread, " puan");
         return;
     }
     
-    // 3️⃣ VOLATİLİTE KONTROLÜ (ATR)
+    // VOLATİLİTE KONTROLÜ
     double atr_vals[];
     ArraySetAsSeries(atr_vals, true);
-    CopyBuffer(atr_handle, 0, 0, 1, atr_vals);
+    if(CopyBuffer(atr_handle, 0, 0, 1, atr_vals) <= 0)
+        return;
     
-    if(atr_vals[0] > 100.0)
+    if(atr_vals[0] > 200.0)  // Çok yüksek volatilite
     {
-        Print("⚠️ Volatilite çok yüksek: ", DoubleToString(atr_vals[0], 2));
         return;
     }
     
-    // 4️⃣ MUM VERİSİ GÜNCELLE
+    // MUM VERİSİ GÜNCELLE
     if(!UpdateCandleData())
         return;
     
-    // 5️⃣ ÖZELLİKLER HAZIRLA
-    float feature_matrix[];
-    if(!PrepareSmartFeatures(feature_matrix))
-        return;
-    
-    // 6️⃣ AI TAHMİNİ (ONNX veya Fallback)
-    double buy_prob = 0.5, sell_prob = 0.5;
-    GetAIPrediction(feature_matrix, buy_prob, sell_prob);
-    
-    // 7️⃣ TEKNIK ANDİKATÖRLER ANALİZİ
+    // TEKNIK GÖSTERGELER ÇALIŞTIRILDI
+    double buy_prob = 0.5;
+    double sell_prob = 0.5;
     int signal_strength = AnalyzeTechnicals(buy_prob, sell_prob);
     
-    // 8️⃣ SİNYAL OLUŞTUR
-    bool buy_signal = (buy_prob >= InpConfidence && signal_strength >= (int)InpMinSignalStrength);
-    bool sell_signal = (sell_prob >= InpConfidence && signal_strength >= (int)InpMinSignalStrength);
-    
     Print("📊 Buy: ", DoubleToString(buy_prob * 100, 1), "% | Sell: ", 
-          DoubleToString(sell_prob * 100, 1), "% | Sinyal: ", signal_strength);
+          DoubleToString(sell_prob * 100, 1), "% | Güç: ", signal_strength, 
+          " | Açık: ", CountOpenPositions(), "/", InpMaxTrades);
     
-    // 9️⃣ TİCARET AÇMA
+    // SİNYAL OLUŞTUR
+    bool buy_signal = (buy_prob >= InpConfidence);
+    bool sell_signal = (sell_prob >= InpConfidence);
+    
+    // AÇIK POZİSYONLARI KONTROL ET
+    CheckOpenPositions(ask, bid);
+    
+    // TİCARET AÇMA
     int open_pos = CountOpenPositions();
     
-    if(open_pos < InpMaxTrades)
+    if(open_pos < InpMaxTrades && last_trade_bar != iBarShift(_Symbol, PERIOD_H1, TimeCurrent()))
     {
-        if(buy_signal)
+        if(buy_signal && buy_prob > sell_prob)
         {
-            double sl = ask - (ask * InpStopLossPct / 100.0);
-            double tp = ask + (ask * InpTakeProfitPct / 100.0);
-            
-            if(trade.Buy(InpLotSize, _Symbol, ask, sl, tp, "🚀 AI BUY"))
-            {
-                stats.total_trades++;
-                Print("✅ ALIM İŞLEMİ: ", InpLotSize, " Lot @ ", DoubleToString(ask, 5));
-            }
+            OpenBuyTrade(ask);
+            last_trade_bar = iBarShift(_Symbol, PERIOD_H1, TimeCurrent());
         }
-        else if(sell_signal)
+        else if(sell_signal && sell_prob > buy_prob)
         {
-            double sl = bid + (bid * InpStopLossPct / 100.0);
-            double tp = bid - (bid * InpTakeProfitPct / 100.0);
-            
-            if(trade.Sell(InpLotSize, _Symbol, bid, sl, tp, "🔽 AI SELL"))
-            {
-                stats.total_trades++;
-                Print("✅ SATIM İŞLEMİ: ", InpLotSize, " Lot @ ", DoubleToString(bid, 5));
-            }
+            OpenSellTrade(bid);
+            last_trade_bar = iBarShift(_Symbol, PERIOD_H1, TimeCurrent());
         }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| ALIM İŞLEMİ AÇMA                                                 |
+//+------------------------------------------------------------------+
+void OpenBuyTrade(double ask)
+{
+    double sl = ask * (1.0 - InpStopLossPct / 100.0);
+    double tp = ask * (1.0 + InpTakeProfitPct / 100.0);
+    
+    if(trade.Buy(InpLotSize, _Symbol, ask, sl, tp, "🚀 AI BUY"))
+    {
+        stats.total_trades++;
+        Print("✅ ALIM: ", InpLotSize, " @ ", DoubleToString(ask, 5), 
+              " SL:", DoubleToString(sl, 5), " TP:", DoubleToString(tp, 5));
+    }
+    else
+    {
+        Print("❌ ALIM HATASI: ", GetLastError());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| SATIM İŞLEMİ AÇMA                                                |
+//+------------------------------------------------------------------+
+void OpenSellTrade(double bid)
+{
+    double sl = bid * (1.0 + InpStopLossPct / 100.0);
+    double tp = bid * (1.0 - InpTakeProfitPct / 100.0);
+    
+    if(trade.Sell(InpLotSize, _Symbol, bid, sl, tp, "🔽 AI SELL"))
+    {
+        stats.total_trades++;
+        Print("✅ SATIM: ", InpLotSize, " @ ", DoubleToString(bid, 5), 
+              " SL:", DoubleToString(sl, 5), " TP:", DoubleToString(tp, 5));
+    }
+    else
+    {
+        Print("❌ SATIM HATASI: ", GetLastError());
     }
 }
 
@@ -233,48 +255,34 @@ void CheckOpenPositions(double ask, double bid)
 {
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
-        if(PositionGetSymbol(i) == _Symbol && 
-           PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-        {
-            ulong ticket = PositionGetTicket(i);
-            long pos_type = PositionGetInteger(POSITION_TYPE);
-            double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-            double current_sl = PositionGetDouble(POSITION_SL);
-            double current_tp = PositionGetDouble(POSITION_TP);
-            
-            // Kar/Zarar hesapla
-            double current_price = (pos_type == POSITION_TYPE_BUY) ? bid : ask;
-            double profit_pct = ((current_price - open_price) / open_price) * 100.0;
-            
-            // Zarar durdurmayı kaldırma (Trailing Stop)
-            if(profit_pct > 0.5 && current_sl > 0)
-            {
-                double new_sl = open_price + (open_price * 0.3 / 100.0);
-                
-                if((pos_type == POSITION_TYPE_BUY && new_sl > current_sl) ||
-                   (pos_type == POSITION_TYPE_SELL && new_sl < current_sl))
-                {
-                    trade.PositionModify(ticket, new_sl, current_tp);
-                }
-            }
-            
-            // İstatistik güncelle
-            if(profit_pct > 0) stats.wins++;
-            else stats.losses++;
-            stats.total_profit += profit_pct;
-        }
+        if(PositionGetSymbol(i) != _Symbol || 
+           PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+            continue;
+        
+        ulong ticket = PositionGetTicket(i);
+        long pos_type = PositionGetInteger(POSITION_TYPE);
+        double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+        
+        // Kar/Zarar hesapla
+        double current_price = (pos_type == POSITION_TYPE_BUY) ? bid : ask;
+        double profit_pct = ((current_price - open_price) / open_price) * 100.0;
+        
+        // İstatistik
+        if(profit_pct > 0) stats.wins++;
+        else stats.losses++;
+        stats.total_profit += profit_pct;
     }
 }
 
 //+------------------------------------------------------------------+
-//| TEKNIK ANDİKATÖRLER ANALİZİ                                      |
+//| TEKNIK ANDİKATÖRLER ANALİZİ (TEK FONKSİYON)                      |
 //+------------------------------------------------------------------+
 int AnalyzeTechnicals(double &buy_prob, double &sell_prob)
 {
     int strength = 0;
     
     double fast[], mid[], slow[], rsi_vals[];
-    double macd_main[], macd_signal[], macd_hist[];
+    double macd_main[], macd_signal[];
     double bb_upper[], bb_lower[];
     
     ArraySetAsSeries(fast, true);
@@ -283,192 +291,80 @@ int AnalyzeTechnicals(double &buy_prob, double &sell_prob)
     ArraySetAsSeries(rsi_vals, true);
     ArraySetAsSeries(macd_main, true);
     ArraySetAsSeries(macd_signal, true);
-    ArraySetAsSeries(macd_hist, true);
     ArraySetAsSeries(bb_upper, true);
     ArraySetAsSeries(bb_lower, true);
     
-    CopyBuffer(ema_fast, 0, 0, 3, fast);
-    CopyBuffer(ema_mid, 0, 0, 3, mid);
-    CopyBuffer(ema_slow, 0, 0, 3, slow);
-    CopyBuffer(rsi_handle, 0, 0, 3, rsi_vals);
-    CopyBuffer(macd_handle, 0, 0, 3, macd_main);
-    CopyBuffer(macd_handle, 1, 0, 3, macd_signal);
-    CopyBuffer(macd_handle, 2, 0, 3, macd_hist);
-    CopyBuffer(bb_handle, 1, 0, 3, bb_upper);
-    CopyBuffer(bb_handle, 2, 0, 3, bb_lower);
+    // Göstergeleri oku
+    CopyBuffer(ema_fast, 0, 0, 2, fast);
+    CopyBuffer(ema_mid, 0, 0, 2, mid);
+    CopyBuffer(ema_slow, 0, 0, 2, slow);
+    CopyBuffer(rsi_handle, 0, 0, 2, rsi_vals);
+    CopyBuffer(macd_handle, 0, 0, 2, macd_main);
+    CopyBuffer(macd_handle, 1, 0, 2, macd_signal);
+    CopyBuffer(bb_handle, 1, 0, 2, bb_upper);
+    CopyBuffer(bb_handle, 2, 0, 2, bb_lower);
     
-    // 🎯 EMA Çapraz Analizi
+    // 1. EMA CROSSOVER
     if(fast[0] > mid[0] && mid[0] > slow[0])
     {
-        buy_prob *= 1.2;
+        buy_prob = 0.75;
+        sell_prob = 0.25;
         strength += 2;
+        Print("   ✓ EMA BULLISH");
     }
     else if(fast[0] < mid[0] && mid[0] < slow[0])
     {
-        sell_prob *= 1.2;
+        buy_prob = 0.25;
+        sell_prob = 0.75;
         strength += 2;
+        Print("   ✓ EMA BEARISH");
     }
     
-    // 🎯 RSI Analizi
-    if(rsi_vals[0] > 30 && rsi_vals[0] < 70)
+    // 2. RSI ANALIZI
+    if(rsi_vals[0] > 50 && rsi_vals[0] < 75)
     {
-        if(rsi_vals[0] > 50 && buy_prob > sell_prob)
-        {
-            buy_prob *= 1.15;
-            strength += 1;
-        }
-        else if(rsi_vals[0] < 50 && sell_prob > buy_prob)
-        {
-            sell_prob *= 1.15;
-            strength += 1;
-        }
+        buy_prob *= 1.2;
+        strength += 1;
+        Print("   ✓ RSI BULLISH");
+    }
+    else if(rsi_vals[0] < 50 && rsi_vals[0] > 25)
+    {
+        sell_prob *= 1.2;
+        strength += 1;
+        Print("   ✓ RSI BEARISH");
     }
     
-    // 🎯 MACD Analizi
-    if(macd_main[0] > macd_signal[0] && macd_hist[0] > 0)
+    // 3. MACD ANALIZI
+    if(macd_main[0] > macd_signal[0])
     {
         buy_prob *= 1.15;
         strength += 1;
+        Print("   ✓ MACD BULLISH");
     }
-    else if(macd_main[0] < macd_signal[0] && macd_hist[0] < 0)
+    else if(macd_main[0] < macd_signal[0])
     {
         sell_prob *= 1.15;
         strength += 1;
+        Print("   ✓ MACD BEARISH");
     }
     
-    // 🎯 Bollinger Bands
+    // 4. BOLLINGER BANDS
     if(candles[0].close < bb_lower[0])
     {
-        buy_prob *= 1.1;
+        buy_prob *= 1.15;
         strength += 1;
-    }
-    else if(candles[0].close > bb_upper[0])
-    {
-        sell_prob *= 1.1;
-        strength += 1;
+        Print("   ✓ BANDS OVERBOUND");
     }
     
-    // Olasılıkları normalize et
+    // Normalize
     double total = buy_prob + sell_prob;
-    buy_prob /= total;
-    sell_prob /= total;
+    if(total > 0)
+    {
+        buy_prob /= total;
+        sell_prob /= total;
+    }
     
     return strength;
-}
-
-//+------------------------------------------------------------------+
-//| AI TAHMİNİ (ONNX + Fallback)                                     |
-//+------------------------------------------------------------------+
-void GetAIPrediction(float &features[], double &buy_prob, double &sell_prob)
-{
-    // ONNX Model var mı kontrol et
-    long onnx_handle = OnnxCreate("smart_model.onnx", ONNX_DEFAULT);
-    
-    if(onnx_handle != INVALID_HANDLE)
-    {
-        float output[];
-        ArrayResize(output, 2);
-        
-        if(OnnxRun(onnx_handle, ONNX_DEFAULT, features, output))
-        {
-            sell_prob = output[0];
-            buy_prob = output[1];
-        }
-        else
-        {
-            Print("⚠️ ONNX tahmin hatası");
-        }
-        
-        OnnxRelease(onnx_handle);
-    }
-    else
-    {
-        // Fallback: Basit kurallar
-        double fast[], mid[], slow[], rsi[];
-        ArraySetAsSeries(fast, true);
-        ArraySetAsSeries(mid, true);
-        ArraySetAsSeries(slow, true);
-        ArraySetAsSeries(rsi, true);
-        
-        CopyBuffer(ema_fast, 0, 0, 1, fast);
-        CopyBuffer(ema_mid, 0, 0, 1, mid);
-        CopyBuffer(ema_slow, 0, 0, 1, slow);
-        CopyBuffer(rsi_handle, 0, 0, 1, rsi);
-        
-        if(global_trend_bias >= -0.1 && candles[0].close > slow[0] && 
-           fast[0] > mid[0] && rsi[0] < 75)
-        {
-            buy_prob = 0.85;
-            sell_prob = 0.15;
-        }
-        else if(global_trend_bias <= 0.1 && candles[0].close < slow[0] && 
-                fast[0] < mid[0] && rsi[0] > 25)
-        {
-            buy_prob = 0.15;
-            sell_prob = 0.85;
-        }
-        else
-        {
-            buy_prob = 0.50;
-            sell_prob = 0.50;
-        }
-    }
-}
-
-//+------------------------------------------------------------------+
-//| AKILLI ÖZELLİKLER HAZIRLA                                        |
-//+------------------------------------------------------------------+
-bool PrepareSmartFeatures(float &out_features[])
-{
-    int total_size = InpSequenceLength * InpFeatureCount;
-    ArrayResize(out_features, total_size);
-    
-    double rsi_vals[], atr_vals[], volume_vals[];
-    ArraySetAsSeries(rsi_vals, true);
-    ArraySetAsSeries(atr_vals, true);
-    ArraySetAsSeries(volume_vals, true);
-    
-    CopyBuffer(rsi_handle, 0, 0, InpSequenceLength, rsi_vals);
-    CopyBuffer(atr_handle, 0, 0, InpSequenceLength, atr_vals);
-    CopyBuffer(volume_handle, 0, 0, InpSequenceLength, volume_vals);
-    
-    int idx = 0;
-    
-    for(int i = 0; i < InpSequenceLength; i++)
-    {
-        // OHLCV
-        out_features[idx++] = (float)candles[i].open;
-        out_features[idx++] = (float)candles[i].high;
-        out_features[idx++] = (float)candles[i].low;
-        out_features[idx++] = (float)candles[i].close;
-        out_features[idx++] = (float)candles[i].tick_volume;
-        
-        // Normalized Indicators
-        out_features[idx++] = (float)(rsi_vals[i] / 100.0);
-        out_features[idx++] = (float)(atr_vals[i] / 10.0);
-        
-        // Price Action
-        float hl_ratio = (candles[i].close - candles[i].low) / 
-                        (candles[i].high - candles[i].low + 0.00001f);
-        out_features[idx++] = hl_ratio;
-        
-        // Momentum
-        out_features[idx++] = (float)((candles[i].close - candles[i].open) / 
-                                      (candles[i].high - candles[i].low + 0.00001f));
-        
-        // Volume Normalized
-        double avg_volume = (i > 0) ? (volume_vals[i-1] + volume_vals[i]) / 2.0 : volume_vals[i];
-        out_features[idx++] = (float)(volume_vals[i] / (avg_volume + 1.0));
-        
-        // Fill remaining features
-        for(int f = 10; f < InpFeatureCount; f++)
-        {
-            float calc = hl_ratio * (f + 1.0f) * (1.0f - (float)(rsi_vals[i] / 100.0f));
-            out_features[idx++] = calc;
-        }
-    }
-    
-    return true;
 }
 
 //+------------------------------------------------------------------+
@@ -506,17 +402,10 @@ int CountOpenPositions()
 }
 
 //+------------------------------------------------------------------+
-//| TİCARET SAATİ KONTROLü                                           |
+//| TİCARET SAATİ KONTROLÜ                                           |
 //+------------------------------------------------------------------+
 bool IsTradeTime()
 {
     int hour = Hour();
-    
-    // NY seansı: 13:00 - 22:00 (GMT+3)
-    if(InpUseNewYorkSession)
-    {
-        return (hour >= InpStartHour && hour < InpEndHour);
-    }
-    
-    return true;
+    return (hour >= InpStartHour && hour < InpEndHour);
 }
