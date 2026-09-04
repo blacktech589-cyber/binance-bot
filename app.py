@@ -1,301 +1,522 @@
 //+------------------------------------------------------------------+
-//|                                SafeScalperPro_H1_Spread40.mq5    |
-//|                                  Copyright 2026, Deep Learning   |
-//|                                             https://www.mql5.com |
+//|                        SmartScalper Pro AI v2.0                  |
+//|                   Derin Öğrenme Tabanlı Ticaret Robotu           |
+//|                      Copyright 2026, AI Trading                  |
 //+------------------------------------------------------------------+
-#property copyright "Copyright 2026"
-#property link      "https://www.mql5.com"
-#property version   "21.01"
+#property copyright "Copyright 2026 AI Trading"
+#property link      "https://github.com/blacktech589-cyber"
+#property version   "2.0"
 #property strict
 
 #include <Trade\Trade.mqh>
 CTrade trade;
 
-input group "--- 80K Geçmiş Analiz & Bellek Yönetimi ---"
-input int      InpHistoryScanCount = 80000;  // Başlangıçta analiz edilecek maksimum geçmiş mum
-input int      InpSequenceLength   = 50;       // Anlık yapay zeka hafıza derinliği
-input int      InpFeatureCount     = 25;       // Özellik derinliği (Özel İstek: 25 Girdi)
-input double   InpConfidence       = 0.85;     // Güven eşiği
-input double   InpMaxAllowedATR    = 20.0;     // Maksimum Volatilite Sınırı
+//========== EXPERT AYARLARI ==========
+input group "🤖 DERİN ÖĞRENME AYARLARI"
+input int      InpHistoryBars      = 1000;      // Geçmiş analiz (1000 mum)
+input int      InpSequenceLength   = 60;        // LSTM hafıza derinliği
+input int      InpFeatureCount     = 25;        // Özellik sayısı
+input double   InpConfidence       = 0.72;      // Güven eşiği (daha akıllı)
+input double   InpMinSignalStrength= 2.0;       // Minimum sinyal gücü
 
-input group "--- İşlem, Lot ve Sabit Risk Yönetimi ---"
-input double   InpLotSize          = 0.01;     // Minimum Lot Miktarı (0.01)
-input double   InpRiskUSD          = 10.0;     // İşlem Başına Sabit Risk ($10)
-input double   InpTakeProfit       = 0.20;     // Hızlı Kâr Hedefi (0.20)
-input int      InpMaxSpread        = 40;       // (GÜNCELLENDİ) Maksimum Spread Sınırı (40 Puan)
-input int      InpMaxTrades        = 1;        // Aynı anda tek pozisyon
-input ulong    InpMagicNumber      = 778899;   // Sihirli Numara
+input group "💰 RİSK YÖNETİMİ"
+input double   InpLotSize          = 0.01;      // Lot miktarı
+input double   InpRiskPercent      = 2.0;       // Hesap riskinin %
+input double   InpTakeProfitPct    = 1.8;       // Kâr hedefi %
+input double   InpStopLossPct      = 0.9;       // Zarar durdurma %
+input int      InpMaxSpread        = 40;        // Maksimum spread (puan)
+input int      InpMaxTrades        = 1;         // Maksimum pozisyon
+input ulong    InpMagicNumber      = 778899;    // Sihirli numara
 
-long ext_onnx_handle = INVALID_HANDLE;
-int rsi_handle = INVALID_HANDLE;
-int atr_handle = INVALID_HANDLE;
-int ema_fast_handle = INVALID_HANDLE;
-int ema_slow_handle = INVALID_HANDLE;
-int h1_ma_handle    = INVALID_HANDLE;
+input group "📊 TİCARET SAATLERİ"
+input int      InpStartHour        = 8;         // Başlangıç saati
+input int      InpEndHour          = 22;        // Bitiş saati
+input bool     InpUseNewYorkSession= true;      // NY seansını kullan
 
-MqlRates memory_candles[];
-double global_longterm_trend_bias = 0.0; 
+//========== GÖSTERGELER ==========
+int rsi_handle, atr_handle;
+int ema_fast, ema_mid, ema_slow;
+int macd_handle, bb_handle;
+int volume_handle;
+
+MqlRates candles[];
+double global_trend_bias = 0.0;
+double longterm_highest = 0.0;
+double longterm_lowest = 0.0;
+
+struct TradeStats {
+    int total_trades;
+    int wins;
+    int losses;
+    double total_profit;
+};
+TradeStats stats = {0, 0, 0, 0.0};
 
 //+------------------------------------------------------------------+
-//| Expert initialization function - 80K GEÇMİŞ ANALİZİ              |
+//| Başlatma Fonksiyonu                                              |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   trade.SetExpertMagicNumber(InpMagicNumber);
-   
-   MqlRates historic_rates[];
-   ArraySetAsSeries(historic_rates, true);
-   
-   int available_bars = CopyRates(_Symbol, PERIOD_H1, 0, InpHistoryScanCount, historic_rates);
-   if(available_bars > 0)
-   {
-      Print("📊 Başarılı: H1 grafiğinden ", available_bars, " adet mum yüklendi ve analiz ediliyor...");
-      
-      double sum_close = 0;
-      double highest_price = historic_rates[0].high;
-      double lowest_price = historic_rates[0].low;
-      
-      for(int i = 0; i < available_bars; i++)
-      {
-         sum_close += historic_rates[i].close;
-         if(historic_rates[i].high > highest_price) highest_price = historic_rates[i].high;
-         if(historic_rates[i].low < lowest_price) lowest_price = historic_rates[i].low;
-      }
-      
-      double average_price = sum_close / (double)available_bars;
-      double current_close = historic_rates[0].close;
-      
-      global_longterm_trend_bias = (current_close - average_price) / (highest_price - lowest_price + 0.00001);
-      Print("📈 80K Analiz Tamamlandı. Uzun Vadeli Trend Eğilim Skoru: ", global_longterm_trend_bias);
-   }
-   else
-   {
-      Print("⚠️ Uyarı: Yeterli H1 geçmiş mumu bulunamadı, varsayılan ayarlarla devam ediliyor.");
-   }
-
-   ext_onnx_handle = OnnxCreate("xauusd_deep_model.onnx", ONNX_DEFAULT);
-   if(ext_onnx_handle == INVALID_HANDLE)
-   {
-      Print("Bilgi: ONNX modeli bulunamadı. Simülasyon Devrede.");
-   }
-   else
-   {
-      long input_shape[] = {1, InpSequenceLength, InpFeatureCount};
-      OnnxSetInputShape(ext_onnx_handle, 0, input_shape);
-      long output_shape[] = {1, 2};
-      OnnxSetOutputShape(ext_onnx_handle, 0, output_shape);
-   }
-
-   rsi_handle      = iRSI(_Symbol, PERIOD_H1, 14, PRICE_CLOSE);
-   atr_handle      = iATR(_Symbol, PERIOD_H1, 14);
-   ema_fast_handle = iMA(_Symbol, PERIOD_H1, 9, 0, MODE_EMA, PRICE_CLOSE);
-   ema_slow_handle = iMA(_Symbol, PERIOD_H1, 21, 0, MODE_EMA, PRICE_CLOSE);
-   h1_ma_handle    = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
-
-   if(rsi_handle == INVALID_HANDLE || atr_handle == INVALID_HANDLE || 
-      ema_fast_handle == INVALID_HANDLE || ema_slow_handle == INVALID_HANDLE || h1_ma_handle == INVALID_HANDLE)
-      return(INIT_FAILED);
-
-   ArrayResize(memory_candles, InpSequenceLength + 10);
-   return(INIT_SUCCEEDED);
+    trade.SetExpertMagicNumber(InpMagicNumber);
+    trade.SetDeviationInPoints(50);
+    trade.SetTypeFilling(ORDER_FILLING_IOC);
+    
+    // Tarihsel analiz
+    MqlRates hist_rates[];
+    ArraySetAsSeries(hist_rates, true);
+    
+    int bars = CopyRates(_Symbol, PERIOD_H1, 0, InpHistoryBars, hist_rates);
+    if(bars > 0)
+    {
+        double sum_close = 0;
+        longterm_highest = hist_rates[0].high;
+        longterm_lowest = hist_rates[0].low;
+        
+        for(int i = 0; i < bars; i++)
+        {
+            sum_close += hist_rates[i].close;
+            if(hist_rates[i].high > longterm_highest) longterm_highest = hist_rates[i].high;
+            if(hist_rates[i].low < longterm_lowest) longterm_lowest = hist_rates[i].low;
+        }
+        
+        double avg_price = sum_close / (double)bars;
+        double current = hist_rates[0].close;
+        global_trend_bias = (current - avg_price) / (longterm_highest - longterm_lowest + 0.00001);
+        
+        Print("✅ ", bars, " mum analiz ediliyor... Trend Skoru: ", DoubleToString(global_trend_bias, 3));
+    }
+    
+    // ONNX Derin Öğrenme Modeli
+    long onnx_handle = OnnxCreate("smart_model.onnx", ONNX_DEFAULT);
+    if(onnx_handle != INVALID_HANDLE)
+    {
+        Print("🧠 ONNX Model Yüklendi!");
+        long input_shape[] = {1, InpSequenceLength, InpFeatureCount};
+        long output_shape[] = {1, 2};
+        OnnxSetInputShape(onnx_handle, 0, input_shape);
+        OnnxSetOutputShape(onnx_handle, 0, output_shape);
+    }
+    else
+    {
+        Print("⚠️ ONNX Model Bulunamadı - Fallback Mode");
+    }
+    
+    // Göstergeler
+    rsi_handle   = iRSI(_Symbol, PERIOD_H1, 14, PRICE_CLOSE);
+    atr_handle   = iATR(_Symbol, PERIOD_H1, 14);
+    ema_fast     = iMA(_Symbol, PERIOD_H1, 9, 0, MODE_EMA, PRICE_CLOSE);
+    ema_mid      = iMA(_Symbol, PERIOD_H1, 21, 0, MODE_EMA, PRICE_CLOSE);
+    ema_slow     = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
+    macd_handle  = iMACD(_Symbol, PERIOD_H1, 12, 26, 9, PRICE_CLOSE);
+    bb_handle    = iBands(_Symbol, PERIOD_H1, 20, 2, PRICE_CLOSE);
+    volume_handle= iVolumes(_Symbol, PERIOD_H1, VOLUME_TICK);
+    
+    if(rsi_handle == INVALID_HANDLE || atr_handle == INVALID_HANDLE)
+        return(INIT_FAILED);
+    
+    ArrayResize(candles, InpSequenceLength + 10);
+    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
+//| Durma Fonksiyonu                                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(ext_onnx_handle != INVALID_HANDLE) OnnxRelease(ext_onnx_handle);
-   IndicatorRelease(rsi_handle);
-   IndicatorRelease(atr_handle);
-   IndicatorRelease(ema_fast_handle);
-   IndicatorRelease(ema_slow_handle);
-   IndicatorRelease(h1_ma_handle);
+    IndicatorRelease(rsi_handle);
+    IndicatorRelease(atr_handle);
+    IndicatorRelease(ema_fast);
+    IndicatorRelease(ema_mid);
+    IndicatorRelease(ema_slow);
+    IndicatorRelease(macd_handle);
+    IndicatorRelease(bb_handle);
+    IndicatorRelease(volume_handle);
+    
+    Print("📊 Ticaret İstatistikleri:");
+    Print("   Toplam İşlem: ", stats.total_trades);
+    Print("   Kazananlar: ", stats.wins);
+    Print("   Kaybedenler: ", stats.losses);
+    Print("   Net Kâr: $", DoubleToString(stats.total_profit, 2));
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                             |
+//| MAIN TİCARET FONKSİYONU                                          |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-   // 1. ÇOK HIZLI KÂR (TP) KAPATMA KONTROLÜ
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-      {
-         ulong ticket = PositionGetTicket(i);
-         long pos_type = PositionGetInteger(POSITION_TYPE);
-         double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-
-         if(pos_type == POSITION_TYPE_BUY && bid >= open_price + InpTakeProfit)
-         {
-            trade.PositionClose(ticket);
-            Print("⚡ Hızlı Kâr Alındı! H1 Alış pozisyonu kapatıldı.");
-            return;
-         }
-         else if(pos_type == POSITION_TYPE_SELL && ask <= open_price - InpTakeProfit)
-         {
-            trade.PositionClose(ticket);
-            Print("⚡ Hızlı Kâr Alındı! H1 Satış pozisyonu kapatıldı.");
-            return;
-         }
-      }
-   }
-
-   // 2. Spread Kontrolü (40 Puan)
-   long current_spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   if(current_spread > InpMaxSpread) return;
-
-   // 3. ATR Volatilite Kontrolü
-   double atr_vals[];
-   ArraySetAsSeries(atr_vals, true);
-   if(CopyBuffer(atr_handle, 0, 0, 1, atr_vals) > 0)
-   {
-      if(atr_vals[0] > InpMaxAllowedATR) return; 
-   }
-
-   if(!UpdateCandleMemory()) return;
-
-   float input_data[];
-   if(!PrepareFeatureMatrix(input_data)) return;
-
-   double buy_probability = 0.5;
-   double sell_probability = 0.5;
-
-   if(ext_onnx_handle != INVALID_HANDLE)
-   {
-      float output_data[];
-      ArrayResize(output_data, 2);
-      if(OnnxRun(ext_onnx_handle, ONNX_DEFAULT, input_data, output_data))
-      {
-         sell_probability = output_data[0];
-         buy_probability  = output_data[1];
-      }
-   }
-   else
-   {
-      double fast_ma[], slow_ma[], h1_ma[], rsi_vals[];
-      ArraySetAsSeries(fast_ma, true);
-      ArraySetAsSeries(slow_ma, true);
-      ArraySetAsSeries(h1_ma, true);
-      ArraySetAsSeries(rsi_vals, true);
-      
-      CopyBuffer(ema_fast_handle, 0, 0, 2, fast_ma);
-      CopyBuffer(ema_slow_handle, 0, 0, 2, slow_ma);
-      CopyBuffer(h1_ma_handle, 0, 0, 2, h1_ma);
-      CopyBuffer(rsi_handle, 0, 0, 2, rsi_vals);
-
-      bool safe_bullish = (global_longterm_trend_bias >= -0.1 && memory_candles[0].close > h1_ma[0] && fast_ma[0] > slow_ma[0] && rsi_vals[0] < 75);
-      bool safe_bearish = (global_longterm_trend_bias <= 0.1 && memory_candles[0].close < h1_ma[0] && fast_ma[0] < slow_ma[0] && rsi_vals[0] > 25);
-
-      if(safe_bullish)  { buy_probability = 0.90; sell_probability = 0.10; }
-      else if(safe_bearish) { buy_probability = 0.10; sell_probability = 0.90; }
-      else              { buy_probability = 0.50; sell_probability = 0.50; }
-   }
-
-   bool is_buy_signal = (buy_probability >= InpConfidence);
-   bool is_sell_signal = (sell_probability >= InpConfidence);
-
-   double price_risk_distance = InpRiskUSD / (InpLotSize * 100.0);
-   int open_positions = 0;
-
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-      {
-         open_positions++;
-         ulong ticket = PositionGetTicket(i);
-         long pos_type = PositionGetInteger(POSITION_TYPE);
-
-         if(pos_type == POSITION_TYPE_BUY && is_sell_signal)
-         {
-            trade.PositionClose(ticket);
-            double sl = bid + price_risk_distance;
-            trade.Sell(InpLotSize, _Symbol, bid, sl, 0, "Flip Sell");
-            return;
-         }
-         else if(pos_type == POSITION_TYPE_SELL && is_buy_signal)
-         {
-            trade.PositionClose(ticket);
-            double sl = ask - price_risk_distance;
-            trade.Buy(InpLotSize, _Symbol, ask, sl, 0, "Flip Buy");
-            return;
-         }
-      }
-   }
-
-   if(open_positions < InpMaxTrades)
-   {
-      if(is_buy_signal)
-      {
-         double sl = ask - price_risk_distance;
-         trade.Buy(InpLotSize, _Symbol, ask, sl, 0, "H1 Buy");
-      }
-      else if(is_sell_signal)
-      {
-         double sl = bid + price_risk_distance;
-         trade.Sell(InpLotSize, _Symbol, bid, sl, 0, "H1 Sell");
-      }
-   }
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    // Pazar saati kontrolü
+    if(!IsTradeTime())
+        return;
+    
+    // 1️⃣ AÇIK POZİSYON KONTROLÜ (Kar/Zarar)
+    CheckOpenPositions(ask, bid);
+    
+    // 2️⃣ SPREAD KONTROLÜ (Maksimum 40 puan)
+    long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+    if(spread > InpMaxSpread)
+    {
+        Print("⚠️ Spread çok yüksek: ", spread, " puan");
+        return;
+    }
+    
+    // 3️⃣ VOLATİLİTE KONTROLÜ (ATR)
+    double atr_vals[];
+    ArraySetAsSeries(atr_vals, true);
+    CopyBuffer(atr_handle, 0, 0, 1, atr_vals);
+    
+    if(atr_vals[0] > 100.0)
+    {
+        Print("⚠️ Volatilite çok yüksek: ", DoubleToString(atr_vals[0], 2));
+        return;
+    }
+    
+    // 4️⃣ MUM VERİSİ GÜNCELLE
+    if(!UpdateCandleData())
+        return;
+    
+    // 5️⃣ ÖZELLİKLER HAZIRLA
+    float feature_matrix[];
+    if(!PrepareSmartFeatures(feature_matrix))
+        return;
+    
+    // 6️⃣ AI TAHMİNİ (ONNX veya Fallback)
+    double buy_prob = 0.5, sell_prob = 0.5;
+    GetAIPrediction(feature_matrix, buy_prob, sell_prob);
+    
+    // 7️⃣ TEKNIK ANDİKATÖRLER ANALİZİ
+    int signal_strength = AnalyzeTechnicals(buy_prob, sell_prob);
+    
+    // 8️⃣ SİNYAL OLUŞTUR
+    bool buy_signal = (buy_prob >= InpConfidence && signal_strength >= (int)InpMinSignalStrength);
+    bool sell_signal = (sell_prob >= InpConfidence && signal_strength >= (int)InpMinSignalStrength);
+    
+    Print("📊 Buy: ", DoubleToString(buy_prob * 100, 1), "% | Sell: ", 
+          DoubleToString(sell_prob * 100, 1), "% | Sinyal: ", signal_strength);
+    
+    // 9️⃣ TİCARET AÇMA
+    int open_pos = CountOpenPositions();
+    
+    if(open_pos < InpMaxTrades)
+    {
+        if(buy_signal)
+        {
+            double sl = ask - (ask * InpStopLossPct / 100.0);
+            double tp = ask + (ask * InpTakeProfitPct / 100.0);
+            
+            if(trade.Buy(InpLotSize, _Symbol, ask, sl, tp, "🚀 AI BUY"))
+            {
+                stats.total_trades++;
+                Print("✅ ALIM İŞLEMİ: ", InpLotSize, " Lot @ ", DoubleToString(ask, 5));
+            }
+        }
+        else if(sell_signal)
+        {
+            double sl = bid + (bid * InpStopLossPct / 100.0);
+            double tp = bid - (bid * InpTakeProfitPct / 100.0);
+            
+            if(trade.Sell(InpLotSize, _Symbol, bid, sl, tp, "🔽 AI SELL"))
+            {
+                stats.total_trades++;
+                Print("✅ SATIM İŞLEMİ: ", InpLotSize, " Lot @ ", DoubleToString(bid, 5));
+            }
+        }
+    }
 }
 
-bool UpdateCandleMemory()
+//+------------------------------------------------------------------+
+//| AÇIK POZİSYON KONTROLÜ                                           |
+//+------------------------------------------------------------------+
+void CheckOpenPositions(double ask, double bid)
 {
-   MqlRates temp_rates[];
-   ArraySetAsSeries(temp_rates, true);
-   
-   if(CopyRates(_Symbol, PERIOD_H1, 0, InpSequenceLength + 5, temp_rates) < InpSequenceLength)
-      return false;
-
-   ArrayResize(memory_candles, InpSequenceLength);
-   ArrayCopy(memory_candles, temp_rates, 0, 0, InpSequenceLength);
-   return true;
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(PositionGetSymbol(i) == _Symbol && 
+           PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+        {
+            ulong ticket = PositionGetTicket(i);
+            long pos_type = PositionGetInteger(POSITION_TYPE);
+            double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+            double current_sl = PositionGetDouble(POSITION_SL);
+            double current_tp = PositionGetDouble(POSITION_TP);
+            
+            // Kar/Zarar hesapla
+            double current_price = (pos_type == POSITION_TYPE_BUY) ? bid : ask;
+            double profit_pct = ((current_price - open_price) / open_price) * 100.0;
+            
+            // Zarar durdurmayı kaldırma (Trailing Stop)
+            if(profit_pct > 0.5 && current_sl > 0)
+            {
+                double new_sl = open_price + (open_price * 0.3 / 100.0);
+                
+                if((pos_type == POSITION_TYPE_BUY && new_sl > current_sl) ||
+                   (pos_type == POSITION_TYPE_SELL && new_sl < current_sl))
+                {
+                    trade.PositionModify(ticket, new_sl, current_tp);
+                }
+            }
+            
+            // İstatistik güncelle
+            if(profit_pct > 0) stats.wins++;
+            else stats.losses++;
+            stats.total_profit += profit_pct;
+        }
+    }
 }
 
-bool PrepareFeatureMatrix(float &out_matrix[])
+//+------------------------------------------------------------------+
+//| TEKNIK ANDİKATÖRLER ANALİZİ                                      |
+//+------------------------------------------------------------------+
+int AnalyzeTechnicals(double &buy_prob, double &sell_prob)
 {
-   int total_size = InpSequenceLength * InpFeatureCount;
-   ArrayResize(out_matrix, total_size);
+    int strength = 0;
+    
+    double fast[], mid[], slow[], rsi_vals[];
+    double macd_main[], macd_signal[], macd_hist[];
+    double bb_upper[], bb_lower[];
+    
+    ArraySetAsSeries(fast, true);
+    ArraySetAsSeries(mid, true);
+    ArraySetAsSeries(slow, true);
+    ArraySetAsSeries(rsi_vals, true);
+    ArraySetAsSeries(macd_main, true);
+    ArraySetAsSeries(macd_signal, true);
+    ArraySetAsSeries(macd_hist, true);
+    ArraySetAsSeries(bb_upper, true);
+    ArraySetAsSeries(bb_lower, true);
+    
+    CopyBuffer(ema_fast, 0, 0, 3, fast);
+    CopyBuffer(ema_mid, 0, 0, 3, mid);
+    CopyBuffer(ema_slow, 0, 0, 3, slow);
+    CopyBuffer(rsi_handle, 0, 0, 3, rsi_vals);
+    CopyBuffer(macd_handle, 0, 0, 3, macd_main);
+    CopyBuffer(macd_handle, 1, 0, 3, macd_signal);
+    CopyBuffer(macd_handle, 2, 0, 3, macd_hist);
+    CopyBuffer(bb_handle, 1, 0, 3, bb_upper);
+    CopyBuffer(bb_handle, 2, 0, 3, bb_lower);
+    
+    // 🎯 EMA Çapraz Analizi
+    if(fast[0] > mid[0] && mid[0] > slow[0])
+    {
+        buy_prob *= 1.2;
+        strength += 2;
+    }
+    else if(fast[0] < mid[0] && mid[0] < slow[0])
+    {
+        sell_prob *= 1.2;
+        strength += 2;
+    }
+    
+    // 🎯 RSI Analizi
+    if(rsi_vals[0] > 30 && rsi_vals[0] < 70)
+    {
+        if(rsi_vals[0] > 50 && buy_prob > sell_prob)
+        {
+            buy_prob *= 1.15;
+            strength += 1;
+        }
+        else if(rsi_vals[0] < 50 && sell_prob > buy_prob)
+        {
+            sell_prob *= 1.15;
+            strength += 1;
+        }
+    }
+    
+    // 🎯 MACD Analizi
+    if(macd_main[0] > macd_signal[0] && macd_hist[0] > 0)
+    {
+        buy_prob *= 1.15;
+        strength += 1;
+    }
+    else if(macd_main[0] < macd_signal[0] && macd_hist[0] < 0)
+    {
+        sell_prob *= 1.15;
+        strength += 1;
+    }
+    
+    // 🎯 Bollinger Bands
+    if(candles[0].close < bb_lower[0])
+    {
+        buy_prob *= 1.1;
+        strength += 1;
+    }
+    else if(candles[0].close > bb_upper[0])
+    {
+        sell_prob *= 1.1;
+        strength += 1;
+    }
+    
+    // Olasılıkları normalize et
+    double total = buy_prob + sell_prob;
+    buy_prob /= total;
+    sell_prob /= total;
+    
+    return strength;
+}
 
-   double rsi_vals[], atr_vals[];
-   ArraySetAsSeries(rsi_vals, true);
-   ArraySetAsSeries(atr_vals, true);
+//+------------------------------------------------------------------+
+//| AI TAHMİNİ (ONNX + Fallback)                                     |
+//+------------------------------------------------------------------+
+void GetAIPrediction(float &features[], double &buy_prob, double &sell_prob)
+{
+    // ONNX Model var mı kontrol et
+    long onnx_handle = OnnxCreate("smart_model.onnx", ONNX_DEFAULT);
+    
+    if(onnx_handle != INVALID_HANDLE)
+    {
+        float output[];
+        ArrayResize(output, 2);
+        
+        if(OnnxRun(onnx_handle, ONNX_DEFAULT, features, output))
+        {
+            sell_prob = output[0];
+            buy_prob = output[1];
+        }
+        else
+        {
+            Print("⚠️ ONNX tahmin hatası");
+        }
+        
+        OnnxRelease(onnx_handle);
+    }
+    else
+    {
+        // Fallback: Basit kurallar
+        double fast[], mid[], slow[], rsi[];
+        ArraySetAsSeries(fast, true);
+        ArraySetAsSeries(mid, true);
+        ArraySetAsSeries(slow, true);
+        ArraySetAsSeries(rsi, true);
+        
+        CopyBuffer(ema_fast, 0, 0, 1, fast);
+        CopyBuffer(ema_mid, 0, 0, 1, mid);
+        CopyBuffer(ema_slow, 0, 0, 1, slow);
+        CopyBuffer(rsi_handle, 0, 0, 1, rsi);
+        
+        if(global_trend_bias >= -0.1 && candles[0].close > slow[0] && 
+           fast[0] > mid[0] && rsi[0] < 75)
+        {
+            buy_prob = 0.85;
+            sell_prob = 0.15;
+        }
+        else if(global_trend_bias <= 0.1 && candles[0].close < slow[0] && 
+                fast[0] < mid[0] && rsi[0] > 25)
+        {
+            buy_prob = 0.15;
+            sell_prob = 0.85;
+        }
+        else
+        {
+            buy_prob = 0.50;
+            sell_prob = 0.50;
+        }
+    }
+}
 
-   CopyBuffer(rsi_handle, 0, 0, InpSequenceLength, rsi_vals);
-   CopyBuffer(atr_handle, 0, 0, InpSequenceLength, atr_vals);
+//+------------------------------------------------------------------+
+//| AKILLI ÖZELLİKLER HAZIRLA                                        |
+//+------------------------------------------------------------------+
+bool PrepareSmartFeatures(float &out_features[])
+{
+    int total_size = InpSequenceLength * InpFeatureCount;
+    ArrayResize(out_features, total_size);
+    
+    double rsi_vals[], atr_vals[], volume_vals[];
+    ArraySetAsSeries(rsi_vals, true);
+    ArraySetAsSeries(atr_vals, true);
+    ArraySetAsSeries(volume_vals, true);
+    
+    CopyBuffer(rsi_handle, 0, 0, InpSequenceLength, rsi_vals);
+    CopyBuffer(atr_handle, 0, 0, InpSequenceLength, atr_vals);
+    CopyBuffer(volume_handle, 0, 0, InpSequenceLength, volume_vals);
+    
+    int idx = 0;
+    
+    for(int i = 0; i < InpSequenceLength; i++)
+    {
+        // OHLCV
+        out_features[idx++] = (float)candles[i].open;
+        out_features[idx++] = (float)candles[i].high;
+        out_features[idx++] = (float)candles[i].low;
+        out_features[idx++] = (float)candles[i].close;
+        out_features[idx++] = (float)candles[i].tick_volume;
+        
+        // Normalized Indicators
+        out_features[idx++] = (float)(rsi_vals[i] / 100.0);
+        out_features[idx++] = (float)(atr_vals[i] / 10.0);
+        
+        // Price Action
+        float hl_ratio = (candles[i].close - candles[i].low) / 
+                        (candles[i].high - candles[i].low + 0.00001f);
+        out_features[idx++] = hl_ratio;
+        
+        // Momentum
+        out_features[idx++] = (float)((candles[i].close - candles[i].open) / 
+                                      (candles[i].high - candles[i].low + 0.00001f));
+        
+        // Volume Normalized
+        double avg_volume = (i > 0) ? (volume_vals[i-1] + volume_vals[i]) / 2.0 : volume_vals[i];
+        out_features[idx++] = (float)(volume_vals[i] / (avg_volume + 1.0));
+        
+        // Fill remaining features
+        for(int f = 10; f < InpFeatureCount; f++)
+        {
+            float calc = hl_ratio * (f + 1.0f) * (1.0f - (float)(rsi_vals[i] / 100.0f));
+            out_features[idx++] = calc;
+        }
+    }
+    
+    return true;
+}
 
-   int index = 0;
-   for(int i = 0; i < InpSequenceLength; i++)
-   {
-      float o = (float)memory_candles[i].open;
-      float h = (float)memory_candles[i].high;
-      float l = (float)memory_candles[i].low;
-      float c = (float)memory_candles[i].close;
-      float v = (float)memory_candles[i].tick_volume;
+//+------------------------------------------------------------------+
+//| MUM VERİSİ GÜNCELLE                                              |
+//+------------------------------------------------------------------+
+bool UpdateCandleData()
+{
+    MqlRates temp_rates[];
+    ArraySetAsSeries(temp_rates, true);
+    
+    if(CopyRates(_Symbol, PERIOD_H1, 0, InpSequenceLength + 5, temp_rates) < InpSequenceLength)
+        return false;
+    
+    ArrayResize(candles, InpSequenceLength);
+    ArrayCopy(candles, temp_rates, 0, 0, InpSequenceLength);
+    
+    return true;
+}
 
-      out_matrix[index++] = o;
-      out_matrix[index++] = h;
-      out_matrix[index++] = l;
-      out_matrix[index++] = c;
-      out_matrix[index++] = v;
+//+------------------------------------------------------------------+
+//| AÇIK POZİSYON SAYISI                                             |
+//+------------------------------------------------------------------+
+int CountOpenPositions()
+{
+    int count = 0;
+    
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(PositionGetSymbol(i) == _Symbol && 
+           PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+            count++;
+    }
+    
+    return count;
+}
 
-      float r = (i < ArraySize(rsi_vals)) ? (float)rsi_vals[i] / 100.0f : 0.5f;
-      float a = (i < ArraySize(atr_vals)) ? (float)atr_vals[i] / 10.0f : 1.0f;
-
-      out_matrix[index++] = r;
-      out_matrix[index++] = a;
-      out_matrix[index++] = c; 
-      out_matrix[index++] = c; 
-      out_matrix[index++] = 0.0f;
-
-      for(int f = 10; f < InpFeatureCount; f++)
-      {
-         float calculated_feature = ((c - l) / (h - l + 0.00001f)) * (float)(f + 1) * (1.0f - r);
-         out_matrix[index++] = calculated_feature;
-      }
-   }
-   return true;
+//+------------------------------------------------------------------+
+//| TİCARET SAATİ KONTROLü                                           |
+//+------------------------------------------------------------------+
+bool IsTradeTime()
+{
+    int hour = Hour();
+    
+    // NY seansı: 13:00 - 22:00 (GMT+3)
+    if(InpUseNewYorkSession)
+    {
+        return (hour >= InpStartHour && hour < InpEndHour);
+    }
+    
+    return true;
 }
